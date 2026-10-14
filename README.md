@@ -6,7 +6,7 @@
 
 [下载](https://github.com/qfyingque/erpan/releases) · [使用说明](使用说明.md) · [开发接入](开发接入.md) · [更新说明](CHANGELOG.md) · [隐私](PRIVACY.md)
 
-当前整理版本：**code68 / 0.3.37-preview**。功能沿用 code67，统一教程、插件升级说明与发布材料；本次手机长回复、尾音和连续播放尚待试听，见 [验证范围](VERIFICATION.md)。
+当前整理版本：**code69 / 0.3.38-preview**。功能沿用 code68；安装包按 ARM64／ARM32 分开，撤下已停用的气声试验模型；本次手机长回复、尾音和连续播放尚待试听，见 [验证范围](VERIFICATION.md)。
 
 ## 能做什么
 
@@ -22,7 +22,7 @@
 
 ## 安装与升级
 
-Android 8.0 及以上。旧用户覆盖安装同签名 APK，保留配置；先结束语音会话。
+Android 8.0 及以上。常见手机选 `arm64-v8a`，仅支持 32 位的旧手机选 `armeabi-v7a`；两个包二选一。本版不提供 x86 模拟器安装包。旧用户覆盖安装同签名 APK，保留配置；先结束语音会话。
 
 1. 在 Operit 内确认所选聊天能正常文字回复。
 2. Operit → 工具 → 包管理 → ＋，导入 `phone10-mobile-voice.js`，启用并运行 `setup`。
@@ -45,4 +45,4 @@ JDK 21、Android SDK 36、Gradle Wrapper 9.1.0；插件测试使用 Node.js 22+�
 node --test tests/*.test.mjs
 ```
 
-产物为 `mobilevoice/build/outputs/apk/debug/mobilevoice-debug.apk`。分发包沿用维护者原有测试签名；自行编译通常使用不同签名，不能直接覆盖，见 [开发说明](CONTRIBUTING.md)。保留 [MIT 许可证](LICENSE) 与第三方声明。
+产物位于 `mobilevoice/build/outputs/apk/debug/`，分别为 `mobilevoice-arm64-v8a-debug.apk` 和 `mobilevoice-armeabi-v7a-debug.apk`，每份均可独立安装。分发包沿用维护者原有测试签名；自行编译通常使用不同签名，不能直接覆盖，见 [开发说明](CONTRIBUTING.md)。保留 [MIT 许可证](LICENSE) 与第三方声明。

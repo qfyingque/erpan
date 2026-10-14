@@ -13,8 +13,8 @@ android {
         applicationId = "com.huigu.phone10.mobile"
         minSdk = 26
         targetSdk = 36
-        versionCode = 68
-        versionName = "0.3.37-preview"
+        versionCode = 69
+        versionName = "0.3.38-preview"
     }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_1_8
@@ -22,6 +22,16 @@ android {
     }
     kotlinOptions { jvmTarget = "1.8" }
     buildFeatures { compose = true }
+    // Each download is a complete standalone APK for one phone architecture.
+    splits {
+        abi {
+            isEnable = true
+            reset()
+            include("arm64-v8a", "armeabi-v7a")
+            isUniversalApk = false
+        }
+    }
+
 }
 
 dependencies {
