@@ -15,3 +15,5 @@ Protocol references: https://developers.openai.com/api/docs/guides/text-to-speec
 Bailian native protocol references: https://help.aliyun.com/zh/model-studio/cosyvoice-websocket-api and https://help.aliyun.com/zh/model-studio/websocket-for-paraformer-real-time-service . No Alibaba SDK or documentation source is bundled in the application.
 
 License texts and provenance for redistribution are in licenses/. This is a component notice, not a license grant for hosted models or voices.
+
+- YAMNet audio event model: Google / TensorFlow, Apache-2.0; https://github.com/tensorflow/models/tree/master/research/audioset/yamnet . ONNX conversion by zeropointnine, https://huggingface.co/zeropointnine/yamnet-onnx at ac2ca3bd45d12ec1f19f1144205ea529b4e9dedf. Bundled model, class map and hashes: licenses/YAMNet-SOURCES.json; license: licenses/Apache-2.0.txt. Model remains bundled for the retired local sound-cue experiment; ordinary calls do not run this experiment. Training data and private/reference test recordings are not distributed.

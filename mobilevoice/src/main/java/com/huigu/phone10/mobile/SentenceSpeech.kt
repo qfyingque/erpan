@@ -32,10 +32,12 @@ internal class SentenceSpeech(
                         val synthesis = async(Dispatchers.IO) {
                             val synthesisJob = currentCoroutineContext().job
                             var failure: Exception? = null
+                            var audioBytes=0L
                             fun send(packet: Packet) = runBlocking(synthesisJob) { packets.send(packet) }
                             try {
                                 send(Packet.Segment(text))
                                 synthesize(text, { send(Packet.Format(it)) }, { pcm ->
+                                    audioBytes+=pcm.size
                                     var offset = 0
                                     while (offset < pcm.size) {
                                         val end = minOf(offset + 8192, pcm.size)
@@ -43,6 +45,9 @@ internal class SentenceSpeech(
                                         offset = end
                                     }
                                 })
+                                if (audioBytes==0L || audioBytes%2!=0L)
+                                    throw SpeechApiException("本段音频为空或不完整，朗读已停止，请查看文字。")
+                                VoiceDiagnostics.record("segment_audio_complete_bytes_$audioBytes")
                             } catch (cancelled: CancellationException) { throw cancelled }
                             catch (error: Exception) {
                                 // Deliver failure in audio order. A speculative next

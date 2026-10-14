@@ -13,7 +13,8 @@ internal fun MobileSettings.currentVoiceProfile(): VoiceProfile? =
 
 /** Old settings used content matching and an opt-in mixing flag. */
 internal fun MobileSettings.withCurrentVoiceDefaults(): MobileSettings =
-    copy(gameAudioCoexist = true, activeVoiceProfileId = currentVoiceProfile()?.id)
+    // Retired capture experiment must not survive an upgrade into ordinary calls.
+    copy(gameAudioCoexist = true, activeVoiceProfileId = currentVoiceProfile()?.id, preserveBreath = false)
 
 internal fun MobileSettings.saveVoiceProfile(name: String, replaceId: String? = null): MobileSettings {
     val title = name.trim()

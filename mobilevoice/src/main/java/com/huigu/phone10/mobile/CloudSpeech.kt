@@ -106,8 +106,8 @@ class CloudSpeech(private val config: SpeechConfig, client: OkHttpClient = OkHtt
         }
         val moss = config.effectiveTtsProvider == SpeechConfig.MOSSLAND
         val elevenHttp = config.effectiveTtsProvider == SpeechConfig.ELEVENLABS
-        if (elevenHttp && text.codePointCount(0, text.length) > 4000)
-            throw SpeechApiException("ElevenLabs v3 单段过长，请分段朗读。")
+        if (elevenHttp && text.codePointCount(0, text.length) > if (config.ttsModel == "eleven_v4") 10_000 else 4000)
+            throw SpeechApiException("ElevenLabs 单段过长，请分段朗读。")
         if (moss) VoiceDiagnostics.record("moss_request_chars_${text.length}")
         val json = if (moss) MossSpeech.request(config, text) else if (elevenHttp) JsonObject().apply {
             addProperty("text", text); addProperty("model_id", config.ttsModel)

@@ -11,6 +11,7 @@ internal suspend fun finishPlayback(
     clearPlayer: () -> Unit,
     closePlayer: () -> Unit,
     clearVisual: () -> Unit,
+    finishArchive: suspend () -> Unit = {},
 ) {
     try {
         finishFocus()
@@ -21,7 +22,8 @@ internal suspend fun finishPlayback(
             try {
                 closePlayer()
             } finally {
-                withContext(NonCancellable + visualDispatcher) { clearVisual() }
+                try { withContext(NonCancellable + visualDispatcher) { clearVisual() } }
+                finally { withContext(NonCancellable) { finishArchive() } }
             }
         }
     }

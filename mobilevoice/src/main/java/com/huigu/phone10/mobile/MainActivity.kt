@@ -76,7 +76,10 @@ class MainActivity : ComponentActivity() {
         var checkJob by remember { mutableStateOf<Job?>(null) }
         var showCheck by remember { mutableStateOf(false) }
         var checkResult by remember { mutableStateOf("") }
-        var showProfiles by remember { mutableStateOf(false) }
+        var voicesGroupTab by rememberSaveable { mutableStateOf(false) }
+        var configReturn by rememberSaveable { mutableStateOf("home") }
+        var recentRoles by remember(saved.chatId) { mutableStateOf(emptyList<String>()) }
+        var roleError by remember { mutableStateOf("") }
         var namingProfile by remember { mutableStateOf(false) }
         var profileError by remember { mutableStateOf("") }
         var localVoices by remember { mutableStateOf(emptyList<LocalVoice>()) }
@@ -97,7 +100,7 @@ class MainActivity : ComponentActivity() {
         }
 
         fun openConfig(section: String = "") {
-            draft = saved; target = section; notice = ""; page = "config"
+            draft = saved; target = section; notice = ""; configReturn = "home"; page = "config"
             editingProfileId = saved.currentVoiceProfile()?.id
             sttDrafts.clear(); ttsDrafts.clear()
         }
@@ -114,7 +117,8 @@ class MainActivity : ComponentActivity() {
             if (checking) checkJob?.cancel()
             when (page) {
                 "about" -> page = aboutReturn
-                "config" -> if (draft != saved) askSave = true else { page = "home"; notice = "" }
+                "keepsakes", "voices", "capture_probe" -> page = "home"
+                "config" -> if (draft != saved) askSave = true else { page = configReturn; notice = "" }
                 "appearance" -> { appearanceDraft = appearance; page = "home"; notice = "" }
             }
         }
@@ -133,7 +137,7 @@ class MainActivity : ComponentActivity() {
         }
         fun openProfiles() {
             if (busy || checking || state.running) return
-            profileError = ""; notice = ""; showProfiles = true
+            profileError = ""; roleError = ""; notice = ""; page = "voices"
         }
         fun refreshLocalVoices() {
             if (busy || VoiceService.state.value.running) return
@@ -162,7 +166,7 @@ class MainActivity : ComponentActivity() {
                     }
                     check(!VoiceService.state.value.running) { "call-started" }
                     withContext(Dispatchers.IO) { store.save(next) }
-                    saved = next; draft = next; showProfiles = false
+                    saved = next; draft = next
                     notice = "已保存并使用「${next.currentVoiceProfile()?.name ?: next.voiceName.orEmpty()}」，下次通话生效。"
                 } catch (cancelled: CancellationException) { throw cancelled }
                 catch (error: Exception) {
@@ -191,7 +195,7 @@ class MainActivity : ComponentActivity() {
                     newName ?: requireNotNull(existing).name, if (newName == null) existing?.id else null)
                 persist(next) {
                     draft = next; editingProfileId = next.activeVoiceProfileId
-                    namingProfile = false; askSave = false; profileError = ""; page = "home"
+                    namingProfile = false; askSave = false; profileError = ""; page = configReturn
                     notice = "已保存并使用「${next.currentVoiceProfile()?.name}」。"
                 }
             } catch (invalid: IllegalArgumentException) {
@@ -327,6 +331,37 @@ class MainActivity : ComponentActivity() {
         }
 
         when (page) {
+            "capture_probe" -> CaptureProbePage(onBack = { back() })
+            "voices" -> VoiceProfilesPage(saved,busy,state.running,profileError.ifBlank {notice},
+                groupTab=voicesGroupTab,onTab={voicesGroupTab=it},
+                onUse={id->if(!busy && !VoiceService.state.value.running)useVoiceSelection(saved.selectVoiceProfile(id))},
+                onRemove={id->if(!busy && !VoiceService.state.value.running) {
+                    val next=saved.removeVoiceProfile(id)
+                    persist(next){draft=draft.copy(voiceProfiles=next.voiceProfiles);profileError="";notice="方案已移除。"}
+                }},onCreate={openConfig();configReturn="voices";editingProfileId=null},onBack={back()},
+                localVoices=localVoices,catalogFresh=catalogFresh,onRefresh={refreshLocalVoices()},
+                onLocalVoice={voice->
+                    try {catalogBase?.let {useVoiceSelection(saved.addLocalVoice(it,voice))}}
+                    catch(error:Exception){profileError=error.message ?: "无法保存这个声音。"}
+                },roles=recentRoles,roleError=roleError,onRefreshRoles={
+                if (!busy && !state.running) scope.launch {
+                    busy=true
+                    val selectedChat=saved.chatId
+                    val reader=OperitBridge(this@MainActivity)
+                    try {
+                        val snapshot=reader.readReplies(selectedChat,null,true)
+                        if(saved.chatId==selectedChat){recentRoles=snapshot.roleNames;roleError=if(recentRoles.isEmpty())"最近消息没有角色名，可以手动填写。" else ""}
+                    } catch (_: CancellationException) { throw CancellationException() }
+                    catch (e: Exception) { roleError=if(e.message=="OPERIT_PLUGIN_UPDATE_REQUIRED")"请更新 code58 配套的 O 插件并运行 setup。" else "暂时读取失败，已有绑定保留；也可以手动填写。" }
+                    finally {reader.close();busy=false}
+                }
+            },onBind={role,id->
+                if(!busy && !state.running)try {
+                    val next=saved.bindRoleVoice(role,id)
+                    persist(next){draft=draft.copy(roleVoiceBindings=next.roleVoiceBindings);roleError=""}
+                }catch(e:Exception){roleError=e.message ?: "保存失败"}
+            })
+            "keepsakes" -> VoiceKeepsakesPage { back() }
             "appearance" -> ErpanAppearance(appearanceDraft, avatar, notice, busy,
                 onChange = { appearanceDraft = it.safe() },
                 onPick = { avatarPicker.launch("image/*") },
@@ -409,7 +444,6 @@ class MainActivity : ComponentActivity() {
                     state.pendingDraft?.let { VoiceService.cancelPendingDraft(it.id) }
                     stopService(Intent(this@MainActivity, VoiceService::class.java))
                 },
-                onMic = { if (state.running && !state.changing) startService(Intent(this@MainActivity, VoiceService::class.java).setAction(VoiceService.TOGGLE)) },
                 onOverlay = { enabled -> floatingPreference("ball", enabled) }, onSmart = { enabled ->
                     if (enabled && runCatching { requireNotNull(saved.endJudge).validate() }.isFailure) {
                         openConfig("judge"); draft = draft.copy(smartEndpoint = true, endJudge = draft.endJudge ?: EndJudgeConfig())
@@ -439,26 +473,15 @@ class MainActivity : ComponentActivity() {
                         notice = "草稿已结束；下次识别后会在悬浮待发栏显示。"
                 }, onAvatar = { openAppearance() }, onConfig = { openConfig() },
                 onLogs = { dialog = "最近语音状态" to VoiceDiagnostics.snapshot().ifBlank { "暂无记录" } }, onAbout = { showAbout() },
-                onProfiles = { openProfiles() }, onCaptions = { enabled -> floatingPreference("captions", enabled) },
+                onProfiles = { openProfiles() },
+                onCaptions = { enabled -> floatingPreference("captions", enabled) },
+                onCaptionAppearance = {
+                    showCaptionAppearance(this@MainActivity)
+                },
+                onKeepsakes = { page="keepsakes" },
                 onListenOnly = { enabled -> if (!state.running) persist(saved.copy(listenOnly = enabled)) },
                 onInterrupt = { startService(Intent(this@MainActivity, VoiceService::class.java).setAction(VoiceService.INTERRUPT)) })
         }
-        if (showProfiles) VoiceProfilesDialog(saved, busy || state.running, profileError.ifBlank { notice },
-            onUse = { id ->
-                if (!busy && !state.running) {
-                    useVoiceSelection(saved.selectVoiceProfile(id))
-                }
-            }, onRemove = { id ->
-                if (!busy && !state.running) {
-                    val next = saved.removeVoiceProfile(id)
-                    persist(next) { draft = draft.copy(voiceProfiles = next.voiceProfiles); profileError = ""; notice = "方案已移除。" }
-                }
-            }, onCreate = { showProfiles = false; openConfig(); editingProfileId = null }, onClose = { showProfiles = false },
-            localVoices = localVoices, catalogFresh = catalogFresh, onRefresh = { refreshLocalVoices() },
-            onLocalVoice = { voice ->
-                try { catalogBase?.let { useVoiceSelection(saved.addLocalVoice(it, voice)) } }
-                catch (error: Exception) { profileError = error.message ?: "无法保存这个声音。" }
-            })
         if (namingProfile) VoiceProfileNameDialog("", busy || state.running,
             profileError.ifBlank { notice }, onSave = { name -> saveEditor(name) }, onClose = { namingProfile = false })
         if (showCheck) AlertDialog(onDismissRequest = { checkJob?.cancel(); showCheck = false },
@@ -470,7 +493,7 @@ class MainActivity : ComponentActivity() {
         if (askSave) AlertDialog(onDismissRequest = { askSave = false }, title = { Text("保存这次修改？") },
             text = { Text("配置有尚未保存的内容。") },
             confirmButton = { TextButton(enabled = !busy, onClick = { saveEditor() }) { Text("保存并使用") } },
-            dismissButton = { TextButton(enabled = !busy, onClick = { draft = saved; askSave = false; page = "home"; notice = "" }) { Text("放弃修改") } })
+            dismissButton = { TextButton(enabled = !busy, onClick = { draft = saved; askSave = false; page = configReturn; notice = "" }) { Text("放弃修改") } })
         dialog?.let { (title, text) -> AlertDialog(onDismissRequest = { dialog = null }, title = { Text(title) },
             text = { Text(text, Modifier.heightIn(max = 480.dp).verticalScroll(rememberScrollState()), fontSize = 13.sp) },
             confirmButton = { TextButton(onClick = { dialog = null }) { Text("关闭") } }) }

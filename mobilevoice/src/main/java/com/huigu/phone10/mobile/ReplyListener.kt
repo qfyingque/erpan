@@ -4,9 +4,9 @@ import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.channels.ReceiveChannel
 
-internal data class ObservedReply(val timestamp: Long, val text: String, val finished: Boolean = true)
+internal data class ObservedReply(val timestamp: Long, val text: String, val finished: Boolean = true, val roleName: String = "")
 internal data class ReplySnapshot(val cursor: Long, val replies: List<ObservedReply>, val processing: Boolean, val failed: Boolean = false,
-                                  val notice: String? = null)
+                                  val notice: String? = null, val roleNames: List<String> = emptyList(), val roleMetadata: Boolean = false)
 
 /** Main-dispatcher owner of read-only polling and bounded, transient speech. */
 internal class ReplyListener(
@@ -17,8 +17,11 @@ internal class ReplyListener(
     private val intervalMillis: Long = 500,
     private val diagnose: (String) -> Unit = {},
     private val nowMillis: () -> Long = { System.nanoTime() / 1_000_000 },
+    private val playRole: ((String, ReceiveChannel<String>) -> Job)? = null,
+    private val initialSnapshot: ReplySnapshot? = null,
+    private val finishWhenIdle: (() -> Boolean)? = null,
 ) {
-    private class Utterance(val timestamp: Long, val trace: Long, val enqueuedAt: Long) {
+    private class Utterance(val timestamp: Long, val trace: Long, val enqueuedAt: Long, val roleName: String) {
         val chunks = Channel<String>(Channel.UNLIMITED)
         var text = ""
         var finished = false
@@ -36,7 +39,7 @@ internal class ReplyListener(
     private var traceSequence = 0L
 
     suspend fun run(): Unit = coroutineScope {
-        val baseline = read(null)
+        val baseline = initialSnapshot ?: read(null)
         var cursor = baseline.cursor // Opening never reads historical conversation aloud.
         processing = baseline.processing
         suppressPending = processing
@@ -47,7 +50,7 @@ internal class ReplyListener(
                 if (reply.timestamp in suppressed || reply.consumed) continue
                 diagnose("listen_dequeued_${reply.trace}_wait_ms_${nowMillis() - reply.enqueuedAt}")
                 playingUtterance = reply
-                val job = play(reply.chunks).also { playing = it }
+                val job = (playRole?.invoke(reply.roleName, reply.chunks) ?: play(reply.chunks)).also { playing = it }
                 try { job.join() } finally {
                     diagnose("listen_speaker_released_${reply.trace}")
                     reply.consumed = true
@@ -73,6 +76,7 @@ internal class ReplyListener(
                     lastPollTraceAt = readStarted
                     diagnose("listen_poll_begin_$pollCount")
                 }
+                val finishedBeforeRead = finishWhenIdle?.invoke() == true
                 val snapshot = try { read(cursor) } finally { reading = false }
                 previousReadEnded = nowMillis()
                 val readMillis = previousReadEnded - readStarted
@@ -115,7 +119,7 @@ internal class ReplyListener(
                     var utterance = utterances[reply.timestamp]
                     if (utterance == null) {
                         if (text.isEmpty() && reply.finished) continue
-                        utterance = Utterance(reply.timestamp, ++traceSequence, nowMillis())
+                        utterance = Utterance(reply.timestamp, ++traceSequence, nowMillis(), reply.roleName)
                         utterances[reply.timestamp] = utterance
                         diagnose("listen_enqueued_${utterance.trace}_chars_${text.length}")
                         if (!queue.trySend(utterance).isSuccess) {
@@ -125,6 +129,11 @@ internal class ReplyListener(
                         }
                         // Stop may have happened while queue.send was suspended.
                         if (beforeRead != revision || utterance.consumed) { discard(utterance); continue }
+                    }
+                    if (reply.roleName != utterance.roleName) {
+                        discard(utterance)
+                        report("回复的说话人发生变化，本条已停止朗读。")
+                        continue
                     }
                     if (!text.startsWith(utterance.text)) {
                         discard(utterance)
@@ -158,6 +167,8 @@ internal class ReplyListener(
                 cursor = snapshot.cursor
                 suppressed.removeAll { it <= cursor }
                 utterances.entries.removeAll { it.value.consumed && it.key <= cursor }
+                if (finishedBeforeRead && finishWhenIdle?.invoke() == true && !snapshot.processing &&
+                    snapshot.replies.isEmpty() && utterances.values.all { it.consumed }) break
             }
         } finally { interrupt(); queue.cancel(); speaker.cancelAndJoin() }
     }

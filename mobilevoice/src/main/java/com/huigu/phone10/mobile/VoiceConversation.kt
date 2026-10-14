@@ -30,15 +30,59 @@ class VoiceConversation(
     private val firstClauseTts: Boolean = false,
     private val onSpeechSegment: (String) -> Unit = {},
     private val coherentTts: Boolean = false,
+    private val voiceForRole: ((String) -> ReplyVoice)? = null,
+    private val roleReply: (suspend (String, suspend (String, ReceiveChannel<String>) -> Unit) -> Unit)? = null,
+    private val soundCuesEnabled: Boolean = false,
 ) {
     @Volatile private var active: Job? = null
-    @Volatile private var voiceInterruptionEnabled = true
+    @Volatile private var voiceInterruptionEnabled = !soundCuesEnabled
+    @Volatile private var replying = false
+    @Volatile private var interruptionCandidate: Job? = null
     private var pendingPcm = byteArrayOf()
     private var ignoreUtterance = false
     private data class Review(val id: String, val transcript: SpeechTranscript, var edited: String) {
         fun visible() = PendingVoiceDraft(id, edited)
     }
-    private var review: Review? = null
+    @Volatile private var review: Review? = null
+
+    @Volatile private var speaking = false
+    private var pendingSound: SoundCue? = null
+    private var soundTimer: Job? = null
+
+    fun acceptsSoundCues(): Boolean = soundCuesEnabled && microphoneEnabled &&
+        !replying && active?.isActive != true && review == null && interruptionCandidate?.isActive != true
+
+    /** Sound observations never enter the speech-interruption path or queue behind an AI turn. */
+    fun observeSoundCue(cue: SoundCue) {
+        if (!acceptsSoundCues()) return
+        pendingSound = cue
+        soundTimer?.cancel()
+        soundTimer = scope.launch {
+            delay(700)
+            if (!acceptsSoundCues() || speaking) return@launch
+            val sound = pendingSound ?: return@launch
+            pendingSound = null
+            val transcript = SpeechTranscript(sound.message())
+            if (confirmBeforeSend) {
+                review = Review(UUID.randomUUID().toString(), transcript, transcript.text)
+                report("声音已识别 · 待确认，尚未发送")
+                onDraftChanged(review?.visible())
+            } else {
+                active = scope.launch {
+                    try { sendToChat(transcript.forChat()) }
+                    catch (cancelled: CancellationException) { throw cancelled }
+                    catch (_: Exception) {
+                        currentCoroutineContext().ensureActive()
+                        report("声音提示发送失败，继续聆听；不会自动重发。")
+                    }
+                }
+            }
+        }
+    }
+
+    private fun clearSoundCue() {
+        soundTimer?.cancel(); soundTimer = null; pendingSound = null; speaking = false
+    }
 
     @Volatile var microphoneEnabled: Boolean = true
         private set
@@ -83,23 +127,34 @@ class VoiceConversation(
     }
     fun setMicrophoneEnabled(enabled: Boolean) {
         microphoneEnabled = enabled
+        if (!enabled) clearSoundCue()
+        if (!enabled) { interruptionCandidate?.cancel(); interruptionCandidate = null }
         // Drop unsubmitted capture only; an accepted utterance owns its existing
         // recognition/reply/playback job even while the microphone is muted.
         pendingPcm = byteArrayOf()
         ignoreUtterance = false
     }
 
-    fun setVoiceInterruptionEnabled(enabled: Boolean) { voiceInterruptionEnabled = enabled }
-    fun acceptsSpeech(): Boolean = microphoneEnabled && review == null &&
+    fun setVoiceInterruptionEnabled(enabled: Boolean) {
+        // Reduced processing can make nonverbal sounds look like speech to ASR.
+        // The experimental sound mode accepts input only between replies.
+        voiceInterruptionEnabled = enabled && !soundCuesEnabled
+        if (!voiceInterruptionEnabled) { interruptionCandidate?.cancel(); interruptionCandidate = null }
+    }
+    fun acceptsSpeech(): Boolean = microphoneEnabled && review == null && interruptionCandidate?.isActive != true &&
         (voiceInterruptionEnabled || active?.isActive != true)
 
     /** Call on the service's main dispatcher. No transcript or audio survives the turn. */
     fun submit(pcm: ByteArray): Job {
+        speaking = false
         if (ignoreUtterance || !acceptsSpeech()) {
             ignoreUtterance = false
             return Job().apply { complete() }
         }
         val previous = active
+        if (replying && previous?.isActive == true) return confirmInterruption(pcm, previous)
+        val sound = pendingSound
+        clearSoundCue()
         previous?.cancel()
         stopPlayback()
         val judge = judgeEnd?.takeUnless { confirmBeforeSend }
@@ -115,7 +170,14 @@ class VoiceConversation(
                 }
                 report("正在识别…")
                 val transcript = stage("语音识别失败，请检查识别服务配置与网络。") {
-                    transcribeDetailed?.invoke(recording) ?: SpeechTranscript(transcribe(recording))
+                    val recognized = try {
+                        transcribeDetailed?.invoke(recording) ?: SpeechTranscript(transcribe(recording))
+                    } catch (empty: NoSpeechRecognized) {
+                        if (sound == null) throw empty
+                        SpeechTranscript("")
+                    }
+                    if (recognized.text.isBlank() && sound != null) SpeechTranscript(sound.message())
+                    else recognized.withSoundCue(sound)
                 }
                 val text = transcript.text.trim()
                 if (text.isEmpty()) { pendingPcm = byteArrayOf(); report("没有识别到文字，继续聆听。" ); return@launch }
@@ -153,6 +215,8 @@ class VoiceConversation(
     }
 
     fun interrupt() {
+        clearSoundCue()
+        interruptionCandidate?.cancel(); interruptionCandidate = null
         ignoreUtterance = false
         pendingPcm = byteArrayOf()
         if (review != null) { review = null; onDraftChanged(null) }
@@ -164,6 +228,9 @@ class VoiceConversation(
     fun speechStarted() {
         ignoreUtterance = !acceptsSpeech()
         if (ignoreUtterance) return
+        speaking = true
+        soundTimer?.cancel(); soundTimer = null
+        if (replying) { diagnose("interruption_onset_unconfirmed"); return }
         // A resumed utterance retains buffered audio until it has actually been sent to Operit.
         // Explicit interruption discards the pending input and cancels the turn.
         active?.cancel()
@@ -171,21 +238,77 @@ class VoiceConversation(
         report("正在聆听…")
     }
 
+    private fun confirmInterruption(pcm: ByteArray, previous: Job): Job {
+        interruptionCandidate?.takeIf { it.isActive }?.let { return it }
+        val candidate = scope.launch(start = CoroutineStart.LAZY) {
+            try {
+                diagnose("interruption_recognition_started")
+                val transcript = try {
+                    withTimeout(15_000) { transcribeDetailed?.invoke(pcm) ?: SpeechTranscript(transcribe(pcm)) }
+                } catch (cancelled: CancellationException) {
+                    currentCoroutineContext().ensureActive()
+                    diagnose("interruption_unconfirmed_reply_preserved"); return@launch
+                } catch (_: Exception) {
+                    currentCoroutineContext().ensureActive()
+                    diagnose("interruption_unconfirmed_reply_preserved"); return@launch
+                }
+                currentCoroutineContext().ensureActive()
+                if (transcript.text.isBlank() || !microphoneEnabled || !voiceInterruptionEnabled || active !== previous) {
+                    diagnose("interruption_empty_or_stale_reply_preserved"); return@launch
+                }
+                diagnose("interruption_confirmed")
+                previous.cancel(); stopPlayback(); previous.join()
+                currentCoroutineContext().ensureActive()
+                active = currentCoroutineContext()[Job]
+                interruptionCandidate = null
+                pendingPcm = byteArrayOf()
+                if (confirmBeforeSend) {
+                    review = Review(UUID.randomUUID().toString(), transcript, transcript.text)
+                    report("识别完成 · 待确认，尚未发送"); onDraftChanged(review?.visible())
+                } else {
+                    var unavailable=false
+                    judgeEnd?.let { judge ->
+                        pendingPcm=pcm
+                        report("正在判断是否说完…")
+                        when (judge(transcript.text.trim())) {
+                            false -> { report("似乎还没说完，等你接着说…");delay(continuationMillis) }
+                            null -> unavailable=true
+                            true -> Unit
+                        }
+                    }
+                    currentCoroutineContext().ensureActive()
+                    pendingPcm=byteArrayOf()
+                    sendToChat(transcript.forChat(),unavailable)
+                }
+            } catch (cancelled: CancellationException) { throw cancelled }
+            catch (failure: TurnFailure) { pendingPcm=byteArrayOf(); report(failure.message.orEmpty()) }
+            catch (_: Exception) { pendingPcm=byteArrayOf(); report("插话提交失败；本轮不会自动重发。") }
+            finally {
+                if (interruptionCandidate === currentCoroutineContext()[Job]) interruptionCandidate = null
+            }
+        }
+        interruptionCandidate = candidate
+        candidate.start()
+        return candidate
+    }
+
     /** Speak frontend text without recognition or sending another model request. */
     fun playReply(text: String): Job = playFrontend { chunk -> chunk(text) }
 
-    fun playReplyStream(chunks: ReceiveChannel<String>): Job = playFrontend { chunk ->
+    fun playReplyStream(chunks: ReceiveChannel<String>, roleName: String = ""): Job = playFrontend(roleName) { chunk ->
         for (text in chunks) chunk(text)
     }
 
-    private fun playFrontend(source: suspend (suspend (String) -> Unit) -> Unit): Job {
+    private fun playFrontend(roleName: String = "", source: suspend (suspend (String) -> Unit) -> Unit): Job {
+        clearSoundCue()
+        interruptionCandidate?.cancel(); interruptionCandidate=null
         val previous = active
         previous?.cancel()
         stopPlayback()
         return scope.launch {
             previous?.join()
             try {
-                val speechFailure = streamReply("") { _, chunk -> source(chunk) }
+                val speechFailure = streamReply("", { _, chunk -> source(chunk) }, roleName)
                 report(if (speechFailure == null) "只听回复已开启 · 等待新的回复"
                     else "本条朗读未完成 · 等待新的回复")
             } catch (cancelled: CancellationException) { throw cancelled }
@@ -202,13 +325,43 @@ class VoiceConversation(
 
     private suspend fun sendToChat(text: String, unavailable: Boolean = false) {
         report(if (unavailable) "智能判断不可用，已按静音提交；等待 Operit 回复…" else "等待 Operit 回复…")
-        val speechFailure = streamReply(text)
+        val speechFailure = if (roleReply == null) streamReply(text) else {
+            var failure: String? = null
+            replying = true
+            try {
+                stage("群聊回复读取失败，请检查配套插件；本轮不会自动重发。") {
+                    roleReply.invoke(text) { role, chunks ->
+                        try {
+                            val result = streamReply("", { _, chunk -> for (value in chunks) chunk(value) }, role)
+                            if (result != null) failure = result
+                        } catch (cancelled: CancellationException) { throw cancelled }
+                        catch (_: Exception) {
+                            currentCoroutineContext().ensureActive()
+                            stopPlayback(); failure = "成员声音不可用"
+                            report("成员声音不可用，请检查音色绑定；群聊文字继续。")
+                            for (ignored in chunks) { /* Drain the accepted message without synthesizing. */ }
+                        }
+                    }
+                }
+                failure
+            } finally { replying = false }
+        }
         report(if (speechFailure == null) listeningStatus()
             else "回复已完成，本条朗读未完成 · ${listeningStatus()}")
     }
 
     private suspend fun streamReply(text: String,
-        source: suspend (String, suspend (String) -> Unit) -> Unit = reply) = coroutineScope {
+        source: suspend (String, suspend (String) -> Unit) -> Unit = reply,
+        roleName: String = "") = coroutineScope {
+        val voice = voiceForRole?.invoke(roleName)
+        val speak = voice?.speak ?: this@VoiceConversation.speak
+        val streamSpeak = if (voice != null) voice.streamSpeak else this@VoiceConversation.streamSpeak
+        val sentenceTts = voice?.sentenceTts ?: this@VoiceConversation.sentenceTts
+        val wholeReplyTts = voice?.wholeReplyTts ?: this@VoiceConversation.wholeReplyTts
+        val firstClauseTts = voice?.firstClauseTts ?: this@VoiceConversation.firstClauseTts
+        val coherentTts = voice?.coherentTts ?: this@VoiceConversation.coherentTts
+        val alreadyReplying = replying
+        replying = true
         val replyContext = currentCoroutineContext()
         deliverCaption { onReplyStart() }
         if (wholeReplyTts) report("整段模式 · 等待回复写完…")
@@ -300,7 +453,7 @@ class VoiceConversation(
             speaker.join()
             if (speechFailure == null) diagnose("tts_job_complete")
             speechFailure
-        } finally { timer.cancel(); queue.cancel() }
+        } finally { timer.cancel(); queue.cancel(); replying = alreadyReplying }
     }
 
     private fun deliverCaption(action: () -> Unit) {

@@ -12,6 +12,15 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.StrokeJoin
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.drawscope.scale
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontFamily
@@ -22,12 +31,12 @@ import androidx.compose.ui.viewinterop.AndroidView
 
 @Composable internal fun ErpanHome(settings: MobileSettings, state: VoiceState, avatar: Drawable?,
     appearance: AvatarAppearance,
-    busy: Boolean, notice: String, onStart: () -> Unit, onEnd: () -> Unit, onMic: () -> Unit,
+    busy: Boolean, notice: String, onStart: () -> Unit, onEnd: () -> Unit,
     onOverlay: (Boolean) -> Unit, onSmart: (Boolean) -> Unit, onConfirmBeforeSend: (Boolean) -> Unit,
     onVoiceInterruption: (Boolean) -> Unit, onReviewDraft: () -> Unit,
     onAvatar: () -> Unit,
     onConfig: () -> Unit, onLogs: () -> Unit, onAbout: () -> Unit,
-    onProfiles: () -> Unit, onCaptions: (Boolean) -> Unit,
+    onProfiles: () -> Unit, onCaptions: (Boolean) -> Unit, onCaptionAppearance: () -> Unit, onKeepsakes: () -> Unit,
     onListenOnly: (Boolean) -> Unit, onInterrupt: () -> Unit) {
     var showTitle by remember { mutableStateOf(false) }
     var expanded by remember { mutableStateOf(false) }
@@ -109,15 +118,22 @@ import androidx.compose.ui.viewinterop.AndroidView
                 Text("点开悬浮待发栏改字或发送；挂断会取消。", fontSize = 13.sp, color = ErpanColors.Muted)
             }
         }
-        Column(verticalArrangement = Arrangement.spacedBy(11.dp)) {
-            SectionTitle("声音")
-            ErpanNavigationCard("当前声音", value = settings.displayVoice(),
-                subtitle = listOfNotNull(settings.currentVoiceProfile()?.name,
-                    if (state.running) "结束语音后可切换" else "点此选择语音方案").joinToString(" · "),
-                enabled = !state.running && !busy, onClick = onProfiles)
+        Surface(onClick = onConfig, shape = RoundedCornerShape(14.dp), color = ErpanColors.Paper,
+            border = BorderStroke(0.8.dp, ErpanColors.Line), modifier = Modifier.fillMaxWidth()) {
+            Row(Modifier.padding(horizontal=18.dp,vertical=13.dp),verticalAlignment=Alignment.CenterVertically) {
+                Column(Modifier.weight(1f),verticalArrangement=Arrangement.spacedBy(4.dp)) {
+                    Text("连接配置",fontFamily=FontFamily.Serif,fontSize=20.sp)
+                    Text("聊天 · 识别 · 合成",color=ErpanColors.Muted,fontSize=12.sp)
+                }
+                LineIcon(ErpanIcon.NEXT,modifier=Modifier.size(20.dp))
+            }
         }
-        ErpanNavigationCard("头像与光效", "动图 · 大小 · 裁剪 · 光效", onClick = onAvatar)
-        ErpanNavigationCard("连接配置", "聊天 · 识别 · 合成", onClick = onConfig)
+        Row(Modifier.fillMaxWidth(),horizontalArrangement=Arrangement.spacedBy(12.dp)) {
+            VoiceShortcut("声音收藏", "", true, true, Modifier.weight(1f), onKeepsakes)
+            VoiceShortcut("音色切换", settings.currentVoiceProfile()?.name ?: settings.displayVoice(),
+                false, !state.running && !busy, Modifier.weight(1f), onProfiles)
+        }
+        if (state.running) Text("结束语音后可切换音色",color=ErpanColors.Muted,fontSize=12.sp)
         val panel = remember { GenericShape { size, _ ->
             val cut = minOf(size.width * 0.06f, size.height * 0.1f)
             moveTo(0f, 0f); lineTo(size.width - cut, 0f); lineTo(size.width, cut)
@@ -125,34 +141,37 @@ import androidx.compose.ui.viewinterop.AndroidView
         } }
         Surface(color = ErpanColors.Coal, shape = RoundedCornerShape(13.dp), modifier = Modifier.fillMaxWidth().clip(panel)) {
             Column(Modifier.padding(horizontal = 19.dp, vertical = 22.dp)) {
-                SectionTitle("通话设置", dark = true)
-                Spacer(Modifier.height(12.dp))
-                ErpanToggle("麦克风", state.micEnabled, enabled = !settings.listenOnly && state.running && !state.changing && !busy,
-                    onChange = { onMic() })
-                HorizontalDivider(color = ErpanColors.CoalMuted.copy(alpha = 0.3f), thickness = 0.6.dp)
-                ErpanToggle("后台悬浮球", if (state.running) state.overlayVisible else settings.overlayEnabled,
-                    enabled = !busy && !settings.listenOnly, helper = "语音通话时显示开关麦悬浮球", onChange = onOverlay)
-                HorizontalDivider(color = ErpanColors.CoalMuted.copy(alpha = 0.3f), thickness = 0.6.dp)
-                ErpanToggle("悬浮字幕", if (state.running) state.captionsVisible else settings.captionsEnabled,
-                    enabled = !busy, helper = "显示正在生成的回复；可拖动、收起，文字可能比声音稍快。", onChange = onCaptions)
-                HorizontalDivider(color = ErpanColors.CoalMuted.copy(alpha = 0.3f), thickness = 0.6.dp)
-                ErpanToggle("发送前确认", settings.confirmBeforeSend, enabled = !settings.listenOnly && !state.running && !busy,
-            helper = "识别后在悬浮窗改字，点发送才提交；通话中不可切换。", onChange = onConfirmBeforeSend)
-                HorizontalDivider(color = ErpanColors.CoalMuted.copy(alpha = 0.3f), thickness = 0.6.dp)
-                ErpanToggle("智能结束判断", settings.smartEndpoint && !settings.confirmBeforeSend,
-                    enabled = !settings.listenOnly && !state.running && !busy && !settings.confirmBeforeSend,
-                    helper = if (settings.confirmBeforeSend) "手动确认期间暂停判断服务；关闭发送前确认后恢复原设置。"
-                        else if (settings.smartEndpoint) "使用额外文本模型判断，可能增加等待和费用。" else "关闭时，约 0.55 秒静音提交",
-                    onChange = onSmart)
-                HorizontalDivider(color = ErpanColors.CoalMuted.copy(alpha = 0.3f), thickness = 0.6.dp)
-                ErpanToggle("人声打断", !settings.disableVoiceInterruption, enabled = !settings.listenOnly && !busy,
-                    helper = if (settings.disableVoiceInterruption) "关闭时，等 AI 回复和语音结束后再说。" else "开启时，直接开口即可打断 AI。",
-                    onChange = onVoiceInterruption)
-                Spacer(Modifier.height(14.dp))
-                HorizontalDivider(color = ErpanColors.CoalMuted.copy(alpha = 0.3f), thickness = 0.6.dp)
-                TextButton(onClick = onLogs, contentPadding = PaddingValues(0.dp), modifier = Modifier.padding(top = 8.dp)) {
-                    Text("查看日志", fontFamily = FontFamily.Serif, fontSize = 18.sp, color = ErpanColors.CoalText)
-                    Spacer(Modifier.width(9.dp)); LineIcon(ErpanIcon.ARROW, ErpanColors.CoalText, Modifier.size(18.dp))
+                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween) {
+                    SectionTitle("通话设置", dark = true)
+                    TextButton(onClick = onLogs, contentPadding = PaddingValues(horizontal = 4.dp)) {
+                        Text("日志", fontSize = 12.sp, color = ErpanColors.CoalMuted)
+                        Spacer(Modifier.width(4.dp))
+                        LineIcon(ErpanIcon.ARROW, ErpanColors.CoalMuted, Modifier.size(14.dp))
+                    }
+                }
+                Column(Modifier.padding(top = 12.dp)) {
+                    CompactCallToggle("后台悬浮球", if (state.running) state.overlayVisible else settings.overlayEnabled,
+                        enabled = !busy && !settings.listenOnly,
+                        helper = "点悬浮球开关麦克风", onChange = onOverlay)
+                    CallSettingDivider()
+                    CompactCallToggle("发送前确认", settings.confirmBeforeSend,
+                        enabled = !settings.listenOnly && !state.running && !busy,
+                        helper = "确认后发送", onChange = onConfirmBeforeSend)
+                    CallSettingDivider()
+                    CompactCallToggle("智能结束判断", settings.smartEndpoint && !settings.confirmBeforeSend,
+                        enabled = !settings.listenOnly && !state.running && !busy && !settings.confirmBeforeSend,
+                        helper = if (settings.confirmBeforeSend) "确认发送时不启用"
+                            else if (settings.smartEndpoint) "判断是否说完 · 另计模型费用" else "停顿后自动发送",
+                        onChange = onSmart)
+                    CallSettingDivider()
+                    CompactCallToggle("人声打断", !settings.disableVoiceInterruption,
+                        enabled = !settings.listenOnly && !busy,
+                        helper = "说话时停止 AI 朗读", onChange = onVoiceInterruption)
+                    CallSettingDivider()
+                    CompactCallToggle("悬浮字幕", if (state.running) state.captionsVisible else settings.captionsEnabled,
+                        enabled = !busy, helper = "字幕设置", onChange = onCaptions,
+                        onSettings = onCaptionAppearance)
                 }
             }
         }
@@ -170,6 +189,77 @@ import androidx.compose.ui.viewinterop.AndroidView
     }
     if (showTitle) AlertDialog(onDismissRequest = { showTitle = false }, title = { Text("当前聊天") },
         text = { Text(settings.displayChat()) }, confirmButton = { TextButton(onClick = { showTitle = false }) { Text("关闭") } })
+}
+
+/** Small utilities share one row; avatar editing remains on the existing portrait above. */
+@Composable private fun VoiceShortcut(label: String, detail: String, heart: Boolean, enabled: Boolean,
+    modifier: Modifier, onClick: () -> Unit) {
+    val tint=if(enabled) Color(0xFFB77E90) else ErpanColors.Muted.copy(alpha=0.45f)
+    Surface(onClick=onClick,enabled=enabled,color=ErpanColors.Paper,shape=RoundedCornerShape(12.dp),modifier=modifier) {
+        Column(Modifier.padding(horizontal=8.dp,vertical=9.dp),horizontalAlignment=Alignment.CenterHorizontally,
+            verticalArrangement=Arrangement.spacedBy(7.dp)) {
+            Canvas(Modifier.size(32.dp)) {
+                val stroke=Stroke(width=1.5f,cap=StrokeCap.Round,join=StrokeJoin.Round)
+                scale(size.width/28f,size.height/28f,pivot=Offset.Zero) {
+                    if(heart) {
+                        val path=Path().apply {
+                            moveTo(14f,24f)
+                            cubicTo(11f,21.4f,2.5f,15.2f,2.5f,9.1f)
+                            cubicTo(2.5f,2.9f,10.1f,1.5f,14f,7.2f)
+                            cubicTo(17.9f,1.5f,25.5f,2.9f,25.5f,9.1f)
+                            cubicTo(25.5f,15.2f,17f,21.4f,14f,24f);close()
+                        }
+                        drawPath(path,tint,style=stroke)
+                    } else {
+                        drawLine(tint,Offset(2f,8f),Offset(5.5f,8f),1.5f,StrokeCap.Round)
+                        drawLine(tint,Offset(12.5f,8f),Offset(26f,8f),1.5f,StrokeCap.Round)
+                        drawCircle(tint,3.5f,Offset(9f,8f),style=stroke)
+                        drawLine(tint,Offset(2f,20f),Offset(15.5f,20f),1.5f,StrokeCap.Round)
+                        drawLine(tint,Offset(22.5f,20f),Offset(26f,20f),1.5f,StrokeCap.Round)
+                        drawCircle(tint,3.5f,Offset(19f,20f),style=stroke)
+                    }
+                }
+            }
+            Text(label,fontFamily=FontFamily.Serif,fontSize=17.sp,maxLines=1,
+                color=if(enabled) ErpanColors.Ink else ErpanColors.Muted)
+            Text(detail,fontSize=12.sp,color=ErpanColors.Muted,maxLines=1,overflow=TextOverflow.Ellipsis)
+        }
+    }
+}
+
+@Composable private fun CallSettingDivider() {
+    HorizontalDivider(color = ErpanColors.CoalMuted.copy(alpha = 0.2f), thickness = 0.7.dp)
+}
+
+@Composable private fun CompactCallToggle(title: String, checked: Boolean, enabled: Boolean,
+    helper: String, onChange: (Boolean) -> Unit, onSettings: (() -> Unit)? = null) {
+    Row(Modifier.fillMaxWidth().heightIn(min = 80.dp).padding(horizontal = 2.dp, vertical = 4.dp),
+        verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+        Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(if (onSettings == null) 3.dp else 0.dp)) {
+            Text(title, fontSize = 17.sp, color = ErpanColors.CoalText)
+            if (onSettings == null) {
+                Text(helper, color = ErpanColors.CoalMuted, fontSize = 12.sp, lineHeight = 17.sp)
+            } else {
+                Row(Modifier.fillMaxWidth().heightIn(min = 48.dp)
+                    .clickable(role = Role.Button, onClick = onSettings),
+                    verticalAlignment = Alignment.CenterVertically) {
+                    Text(helper, color = ErpanColors.CoalMuted, fontSize = 12.sp)
+                    Spacer(Modifier.width(4.dp))
+                    LineIcon(ErpanIcon.NEXT, ErpanColors.CoalMuted, Modifier.size(14.dp))
+                }
+            }
+        }
+        Switch(checked = checked, onCheckedChange = onChange, enabled = enabled,
+            modifier = Modifier.semantics { contentDescription = title },
+            thumbContent = { Box(Modifier.size(16.dp)) },
+            colors = SwitchDefaults.colors(
+                checkedThumbColor = Color(0xFFF4F2F1), uncheckedThumbColor = Color(0xFFF4F2F1),
+                checkedTrackColor = Color(0xFF646266), uncheckedTrackColor = Color(0xFF49484C),
+                checkedBorderColor = Color(0xFFCAC7CA), uncheckedBorderColor = Color(0xFFCAC7CA),
+                disabledCheckedThumbColor = Color(0xFFAAA8AB), disabledUncheckedThumbColor = Color(0xFFAAA8AB),
+                disabledCheckedTrackColor = Color(0xFF454448), disabledUncheckedTrackColor = Color(0xFF454448),
+                disabledCheckedBorderColor = Color(0xFF777579), disabledUncheckedBorderColor = Color(0xFF777579)))
+    }
 }
 
 @Composable private fun CallButton(label: String, icon: ErpanIcon, enabled: Boolean, primary: Boolean,

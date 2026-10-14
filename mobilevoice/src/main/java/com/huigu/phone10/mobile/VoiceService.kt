@@ -30,9 +30,18 @@ class VoiceService : Service() {
     private var conversation: VoiceConversation? = null
     private var replyListener: ReplyListener? = null
     private val player = AtomicReference<PcmPlayer?>()
+    @Volatile private var soundInputAfter = 0L
     private var started = false
+    private var replaying = false
+    private var probing = false
+    private var probeOutcome: String? = null
+    private var replay: ClipReplay? = null
+    private data class ReplyArchive(@Volatile var text: String = "")
+    @Volatile private var replyArchive = ReplyArchive()
+    private fun keepsakes() = VoiceKeepsakes(java.io.File(cacheDir,"voice-recent"), java.io.File(filesDir,"voice-saved"))
     private var terminalMessage = "麦克风已关闭"
     private lateinit var config: MobileSettings
+    private var replyVoiceSettings: MobileSettings? = null
     private lateinit var audio: AudioManager
     private var previousMode = AudioManager.MODE_NORMAL
     private var focus: AudioFocusRequest? = null
@@ -55,7 +64,10 @@ class VoiceService : Service() {
     }
 
     private fun stopPlayer() {
-        player.getAndSet(null)?.close()
+        player.getAndSet(null)?.let {
+            soundInputAfter = android.os.SystemClock.elapsedRealtime() + 1000
+            it.close()
+        }
         captionSegment = null
         captionAligned = false
         captionOverlay?.setPlayback(null)
@@ -65,7 +77,37 @@ class VoiceService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (probing) {
+            if (intent?.action == STOP) stopSelf()
+            return START_NOT_STICKY
+        }
         when (intent?.action) {
+            PROBE, PROBE_PLAY -> {
+                if (!started) {
+                    val mode = ProbeMode.entries.firstOrNull { it.name == intent.getStringExtra("mode") }
+                    if (mode == null) stopSelf() else startProbe(mode, intent.action == PROBE_PLAY)
+                }
+                return START_NOT_STICKY
+            }
+            REPLAY -> {
+                val id=intent.getStringExtra("clip").orEmpty()
+                val saved=intent.getBooleanExtra("saved",true)
+                if (!started) startReplay(id,saved)
+                else if (replaying) replay?.play(id,saved)
+                return START_NOT_STICKY
+            }
+            REPLAY_PAUSE -> {
+                if (replaying) replay?.togglePause() else if (!started) stopSelf()
+                return START_NOT_STICKY
+            }
+            REPLAY_SEEK -> {
+                if (replaying) replay?.seek(intent.getLongExtra("frame",0)) else if (!started) stopSelf()
+                return START_NOT_STICKY
+            }
+            REPLAY_STOP -> {
+                if (replaying || !started) { replay?.stop(); stopSelf() }
+                return START_NOT_STICKY
+            }
             VOICE_INTERRUPTION -> {
                 if (started) {
                     val enabled = intent.getBooleanExtra("enabled", true)
@@ -76,7 +118,7 @@ class VoiceService : Service() {
                 return START_NOT_STICKY
             }
             STOP -> { conversation?.interrupt(); stopSelf(); return START_NOT_STICKY }
-            INTERRUPT -> { replyListener?.interrupt(); conversation?.interrupt(); VoiceDiagnostics.record("manual_interrupt"); if (!started) stopSelf(); return START_NOT_STICKY }
+            INTERRUPT -> { replyListener?.interrupt(); conversation?.interrupt(); VoiceDiagnostics.record("manual_interrupt"); if (!started || replaying) { stopPlayer(); stopSelf() }; return START_NOT_STICKY }
             SHOW_DRAFT -> { if (started) revealPendingDraft() else stopSelf(); return START_NOT_STICKY }
             TOGGLE -> { if (started) toggle() else stopSelf(); return START_NOT_STICKY }
             OVERLAY -> {
@@ -116,9 +158,10 @@ class VoiceService : Service() {
                 beginSession()
                 val flow = requireNotNull(conversation)
                 val o = requireNotNull(bridge)
-                val listener = ReplyListener({ after -> o.readReplies(config.chatId, after) },
-                    flow::playReplyStream, { stopPlayer() }, { setState(it) },
-                    diagnose = VoiceDiagnostics::record).also { replyListener = it }
+                val listener = ReplyListener({ after -> o.readReplies(config.chatId, after, config.hasRoleVoices()) },
+                    { chunks -> flow.playReplyStream(chunks) }, { stopPlayer() }, { setState(it) },
+                    diagnose = VoiceDiagnostics::record,
+                    playRole = { role, chunks -> flow.playReplyStream(chunks, role) }).also { replyListener = it }
                 requireNotNull(callScope).launch {
                     try { listener.run() }
                     catch (cancelled: CancellationException) { throw cancelled }
@@ -266,7 +309,7 @@ class VoiceService : Service() {
         val child = CoroutineScope(SupervisorJob(scope.coroutineContext[Job]) + Dispatchers.Main.immediate)
         callScope = child
         val synthesisOwner = Any().also { latestSynthesisOwner = it }
-        val cloud = CloudSpeech(config.speech, onSynthesisStatus = { message ->
+        val synthesisStatus: suspend (String) -> Unit = { message ->
             withContext(Dispatchers.Main.immediate) {
                 ensureActive()
                 if (started && callScope === child) setState(message)
@@ -277,49 +320,79 @@ class VoiceService : Service() {
                     mutableState.value = VoiceState(false,message)
                 }
             }
-        })
+        }
+        val speechClient = okhttp3.OkHttpClient()
+        val cloud = CloudSpeech(config.speech, client = speechClient, onSynthesisStatus = synthesisStatus)
+        val synthesisClients = mutableMapOf(config.speech to cloud)
         val o = OperitBridge(this).also { bridge = it }
         val judge = if (!config.listenOnly && config.smartEndpoint && !config.confirmBeforeSend)
             CloudEndJudge(requireNotNull(config.endJudge)) else null
         wakeLock = (getSystemService(POWER_SERVICE) as PowerManager)
             .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "Phone10Mobile:call").also { it.acquire() }
+        fun replyVoice(role: String): ReplyVoice {
+            val selected = config.voiceForRole(role)
+            replyVoiceSettings = selected
+            val speech = selected.speech
+            val tts = synthesisClients.getOrPut(speech) {
+                CloudSpeech(speech, client = speechClient, onSynthesisStatus = synthesisStatus)
+            }
+            fun write(output: PcmPlayer, pcm: ByteArray) {
+                child.launch { if (callScope === child) setState("正在播放 Operit 的回复…") }
+                output.write(pcm)
+            }
+            val stream: (suspend (kotlinx.coroutines.channels.ReceiveChannel<String>) -> Unit)? =
+                if (speech.sentenceHttpTts) { texts ->
+                    play(voiceSettings = selected) { output ->
+                        SentenceSpeech(tts::speak).speak(texts, output::configure, output::markCaptionSegment) { pcm -> write(output, pcm) }
+                    }
+                } else if (speech.streamingTts) { texts ->
+                    play(voiceSettings = selected) { output ->
+                        tts.speakStream(texts,
+                            onPlayed = { if (speech.effectiveTtsProvider == SpeechConfig.QWEN_LOCAL) {
+                                output.drain(); VoiceDiagnostics.record("playback_drained_before_release")
+                            } },
+                            onAbort = { if (speech.effectiveTtsProvider == SpeechConfig.QWEN_LOCAL) output.close() },
+                            onSegment = output::markCaptionSegment, onPcm = { pcm -> write(output, pcm) })
+                    }
+                } else null
+            return ReplyVoice({ text -> play(voiceSettings = selected) { output ->
+                output.markCaptionSegment(text); tts.speak(text, output::configure, output::write)
+            } }, stream, speech.sentenceHttpTts, speech.wholeReplyTts, speech.clientSegmentedTts, speech.coherentTts)
+        }
         VoiceConversation(child, cloud::transcribe,
             { text, chunk -> o.reply(config.chatId, text, chunk) },
-            { text -> play { output -> cloud.speak(text, output::configure, output::write) } },
+            { error("reply voice required") },
             { stopPlayer() }, { message ->
                 if (started && callScope === child) setState(message)
-            }, streamSpeak = if (config.speech.sentenceHttpTts) { texts ->
-                play { output ->
-                    SentenceSpeech(cloud::speak).speak(texts, output::configure, output::markCaptionSegment) { pcm ->
-                        child.launch { if (callScope === child) setState("正在播放 Operit 的回复…") }
-                        output.write(pcm)
-                    }
-                }
-            } else if (config.speech.streamingTts) { texts ->
-                play { output -> cloud.speakStream(texts,
-                    onPlayed = { if (config.speech.effectiveTtsProvider == SpeechConfig.QWEN_LOCAL) {
-                        output.drain(); VoiceDiagnostics.record("playback_drained_before_release")
-                    } }, onAbort = { if (config.speech.effectiveTtsProvider == SpeechConfig.QWEN_LOCAL) output.close() }, onSegment = output::markCaptionSegment) { pcm ->
-                    child.launch { if (callScope === child) setState("正在播放 Operit 的回复…") }
-                    output.write(pcm)
-                } }
-            } else null, judgeEnd = judge?.let { it::isComplete },
+            }, judgeEnd = judge?.let { it::isComplete },
+            voiceForRole = ::replyVoice,
+            roleReply = if (config.hasRoleVoices()) { text, render ->
+                playRoleReplyTurn(text,
+                    read = { after -> o.readReplies(config.chatId, after, true) },
+                    send = { value -> o.reply(config.chatId, value) { } }, render = render,
+                    stop = { stopPlayer() }, report = { message ->
+                        if (started && callScope === child) setState(if (message.startsWith("只听回复")) "等待群聊回复…" else message)
+                    })
+            } else null,
             sentenceTts = config.speech.sentenceHttpTts,
             wholeReplyTts = config.speech.wholeReplyTts,
             firstClauseTts = config.speech.clientSegmentedTts,
             coherentTts = config.speech.coherentTts,
             transcribeDetailed = cloud::transcribeDetailed,
             confirmBeforeSend = !config.listenOnly && config.confirmBeforeSend,
+            soundCuesEnabled = !config.listenOnly && config.preserveBreath,
             onDraftChanged = { draft ->
                 if (started && callScope === child) updatePendingDraft(draft)
             }, onReplyStart = {
+                replyArchive = ReplyArchive()
                 captionGeneration++
                 captionBuffer.clear(); spokenCaptions.clear(); captionSegment = null
-                captionAligned = config.speech.sentenceHttpTts || config.speech.clientSegmentedTts
+                captionAligned = (replyVoiceSettings ?: config).speech.let { it.sentenceHttpTts || it.clientSegmentedTts }
                 captionOverlay?.resetPlayback()
                 renderCaptions()
             }, onReplyDelta = { delta ->
                 captionBuffer.append(delta)
+                replyArchive.text = captionBuffer.text
                 if (!captionAligned || spokenCaptions.text.isEmpty()) renderCaptions()
             }, onSpeechSegment = { text ->
                 if (captionAligned) { spokenCaptions.append(text); renderCaptions() }
@@ -334,7 +407,7 @@ class VoiceService : Service() {
         val child = requireNotNull(callScope)
         val flow = requireNotNull(conversation)
         foreground()
-        val input = PcmRecorder(this).also { recorder = it }
+        val input = PcmRecorder(this, config.preserveBreath).also { recorder = it }
         val ready = CompletableDeferred<Unit>()
         flow.setMicrophoneEnabled(true)
         captureJob = child.launch {
@@ -350,7 +423,20 @@ class VoiceService : Service() {
                     }
                 } }, {
                     ready.complete(Unit)
-                }, acceptInput = flow::acceptsSpeech)
+                }, acceptInput = flow::acceptsSpeech,
+                    acceptSound = { flow.acceptsSoundCues() && player.get() == null &&
+                        android.os.SystemClock.elapsedRealtime() >= soundInputAfter },
+                    onSound = { cue ->
+                        if (recorder === input && callScope === child && flow.microphoneEnabled) {
+                            VoiceDiagnostics.record("sound_cue_" + cue.name.lowercase())
+                            // Dispatch is suspended until sound metadata has a separate frontend path.
+                        }
+                    }, onSoundStatus = { available -> child.launch {
+                        if (recorder === input && callScope === child) {
+                            VoiceDiagnostics.record(if (available) "sound_model_ready" else "sound_model_unavailable")
+                            if (!available) setState("气声检测暂不可用，普通语音仍可使用。", flow.microphoneEnabled)
+                        }
+                    } })
             } catch (cancelled: CancellationException) { ready.cancel(); throw cancelled }
             catch (error: Exception) {
                 val wasReady = ready.isCompleted && !ready.isCancelled
@@ -374,8 +460,9 @@ class VoiceService : Service() {
         }
     }
 
-    private suspend fun play(synthesize: suspend (PcmPlayer) -> Unit) = withContext(Dispatchers.IO) {
+    private suspend fun play(record: Boolean = true, voiceSettings: MobileSettings = config, synthesize: suspend (PcmPlayer) -> Unit) = withContext(Dispatchers.IO) {
         val owner = requireNotNull(playbackFocus)
+        val words = replyArchive
         var firstPcm = true
         val output = PcmPlayer(mediaPlayback = config.listenOnly) {
             if (firstPcm) {
@@ -384,6 +471,10 @@ class VoiceService : Service() {
             }
             owner.beforePlayback()
         }
+        val capture = if (record) runCatching { keepsakes().begin(voiceSettings.currentVoiceProfile()?.name ?: voiceSettings.displayVoice()) }
+            .onFailure { VoiceDiagnostics.record("voice_cache_unavailable") }.getOrNull() else null
+        output.captureObserver = capture
+        var complete = false
 
         val generation = captionGeneration
         player.set(output)
@@ -412,7 +503,7 @@ class VoiceService : Service() {
             catch (error: Exception) {
                 currentCoroutineContext().ensureActive()
                 VoiceDiagnostics.record("playback_failed_${error.javaClass.simpleName}")
-                if (config.speech.sentenceHttpTts) {
+                if (voiceSettings.speech.sentenceHttpTts) {
                     // A provider error does not invalidate PCM already accepted.
                     // Explicit user interruption still cancels immediately.
                     try { output.drain(); VoiceDiagnostics.record("received_audio_drained_after_error") }
@@ -421,13 +512,16 @@ class VoiceService : Service() {
                 }
                 throw error
             }
-            output.drain(); VoiceDiagnostics.record("playback_drained")
+            output.drain(); complete = true; VoiceDiagnostics.record("playback_drained")
         }
         finally {
             levelJob.cancel()
             finishPlayback(Dispatchers.Main.immediate,
                 finishFocus = { owner.finishedPlayback() },
-                clearPlayer = { player.compareAndSet(output, null) },
+                clearPlayer = {
+                    soundInputAfter = android.os.SystemClock.elapsedRealtime() + 1000
+                    player.compareAndSet(output, null)
+                },
                 closePlayer = { output.close() },
                 clearVisual = {
                     if (captionGeneration == generation && player.get() == null) {
@@ -435,8 +529,115 @@ class VoiceService : Service() {
                         captionSegment = null
                         captionOverlay?.setPlayback(null)
                     }
+                }, finishArchive = {
+                    withContext(Dispatchers.IO) {
+                        runCatching { capture?.finish(output.archiveFrames(), complete, words.text) }
+                            .onFailure { VoiceDiagnostics.record("voice_cache_save_failed") }
+                    }
                 })
         }
+    }
+
+    /** Local replay shares this service's sole player; it never opens a chat, microphone or TTS request. */
+    private fun startProbe(mode: ProbeMode, playback: Boolean) {
+        started = true; probing = true; activeService = this
+        try {
+            config = MobileSettings(SpeechConfig.bailianDefaults(), listenOnly = playback)
+            audio = getSystemService(AUDIO_SERVICE) as AudioManager
+            CaptureProbe.busy(if (playback) "正在试听 ${mode.title}" else "正在开启 ${mode.title}")
+            setState(CaptureProbe.state.value.message, mic = !playback)
+            foreground()
+            acquireAudio(mediaRoute = playback || mode == ProbeMode.MINIMAL)
+            transition = scope.launch {
+                try {
+                    if (playback) {
+                        val sample = requireNotNull(CaptureProbe.state.value.samples[mode])
+                        play(record = false) { output ->
+                            output.configure(16000)
+                            for (offset in sample.pcm.indices step 8192) {
+                                ensureActive(); output.write(sample.pcm.copyOfRange(offset,minOf(offset+8192,sample.pcm.size)))
+                            }
+                        }
+                        probeOutcome = "试听结束"
+                    } else {
+                        val input = PcmRecorder(this@VoiceService, true).also { recorder = it }
+                        val (pcm, details) = input.probe(mode == ProbeMode.MINIMAL) { second ->
+                            scope.launch { if (started && recorder === input) {
+                                CaptureProbe.busy("${mode.title} · 正在录音 $second / 8 秒")
+                            } }
+                        }
+                        recorder = null
+                        ensureActive()
+                        val raw = ProbeSample(pcm, details, CaptureProbe.metrics(pcm), "尚未分析")
+                        CaptureProbe.result(mode, raw)
+                        CaptureProbe.busy("已停止录音，正在本机检测…")
+                        setState("已停止录音，正在本机检测…", mic = false)
+                        val report = analyzeProbe(this@VoiceService, pcm)
+                        ensureActive()
+                        CaptureProbe.result(mode, raw.copy(modelReport = report))
+                        probeOutcome = "${mode.title}完成，可以试听或导出"
+                    }
+                } catch (cancelled: CancellationException) { throw cancelled }
+                catch (error: Exception) {
+                    VoiceDiagnostics.record("capture_probe_failed:${error.javaClass.simpleName}")
+                    probeOutcome = "收音测试失败，请检查麦克风权限和占用；已有录音保留。"
+                }
+                finally { stopSelf() }
+            }
+        } catch (_: Exception) { probeOutcome = "收音测试无法启动。"; stopSelf() }
+    }
+
+    private fun startReplay(id: String, saved: Boolean) {
+        started = true
+        replaying = true
+        activeService = this
+        try {
+            config = SettingsStore(this).load().copy(listenOnly = true)
+            audio = getSystemService(AUDIO_SERVICE) as AudioManager
+            setState("正在打开声音…", changing = true)
+            foreground()
+            acquireAudio()
+            wakeLock = (getSystemService(POWER_SERVICE) as PowerManager)
+                .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK,"Earban:keepsake").also { it.acquire(30*60*1000L) }
+            val store=keepsakes()
+            replay=ClipReplay(scope,
+                load={ key, permanent -> withContext(Dispatchers.IO) { store.clip(key,permanent) } },
+                render={ clip, permanent, start, progress ->
+                    captionGeneration++
+                    captionBuffer.clear(); captionBuffer.append(clip.text)
+                    spokenCaptions.clear(); captionAligned=false
+                    setState("正在试听 · ${clip.voice}")
+                    play(record = false) { output ->
+                        output.configure(clip.rate)
+                        output.setUserPaused(replay?.state?.paused==true)
+                        coroutineScope {
+                            val monitor=launch(Dispatchers.Main.immediate) {
+                                while (isActive) {
+                                    progress(start+output.archiveFrames()); delay(80)
+                                }
+                            }
+                            try {
+                                store.openAudio(clip.id,permanent).use { input ->
+                                    input.seek(44+start*2)
+                                    var remaining=(clip.frames-start)*2
+                                    val buffer=ByteArray(8192)
+                                    while (remaining>0) {
+                                        ensureActive()
+                                        val n=input.read(buffer,0,minOf(remaining,buffer.size.toLong()).toInt())
+                                        check(n>0) { "音频文件不完整" }
+                                        output.write(buffer.copyOf(n)); remaining-=n
+                                    }
+                                }
+                                output.drain()
+                            } finally { monitor.cancel() }
+                        }
+                    }
+                }, stopOutput=::stopPlayer,
+                pauseOutput={ player.get()?.setUserPaused(it) },
+                publish={ mutableReplay.value=it },
+                ended={ message -> terminalMessage=message; stopSelf() })
+            replay?.play(id,saved)
+        } catch (_: Exception) { terminalMessage="收藏播放启动失败。"; stopSelf() }
     }
 
     private suspend fun mute(message: String) {
@@ -455,7 +656,7 @@ class VoiceService : Service() {
         if (started) foreground()
     }
 
-    private fun acquireAudio() {
+    private fun acquireAudio(mediaRoute: Boolean = config.listenOnly) {
         previousMode = audio.mode
         val owner = VoiceAudioFocus({
             val granted = audio.requestAudioFocus(requireNotNull(focus)) == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
@@ -478,7 +679,7 @@ class VoiceService : Service() {
         VoiceDiagnostics.record(if (config.gameAudioCoexist) "game_audio_coexist_on" else "game_audio_coexist_off")
         // Listening follows the system media output (including A2DP). Only microphone
         // calls require communication routing/AEC. Game coexist keeps its focus policy.
-        if (config.listenOnly) {
+        if (mediaRoute) {
             audio.mode = AudioManager.MODE_NORMAL
             VoiceDiagnostics.record("audio_route_system_media")
         } else {
@@ -511,16 +712,17 @@ class VoiceService : Service() {
         val mic = mutableState.value.micEnabled
         val notification = NotificationCompat.Builder(this, CHANNEL)
             .setSmallIcon(android.R.drawable.ic_btn_speak_now)
-            .setContentTitle(if (mutableState.value.pendingDraft != null) "耳畔 · 语音待确认"
+            .setContentTitle(if (probing) "耳畔 · 收音对比" else if (replaying) "耳畔 · 收藏试听" else if (mutableState.value.pendingDraft != null) "耳畔 · 语音待确认"
                 else if (config.listenOnly) "耳畔 · 只听回复" else if (mic) "耳畔 · 麦克风已开启" else "耳畔 · 麦克风已关闭")
-            .setContentText(if (mutableState.value.pendingDraft != null) "点开悬浮待发栏，改字后再发送；挂断会取消"
+            .setContentText(if (probing) CaptureProbe.state.value.message else if (replaying) "正在播放手机里保存的声音" else if (mutableState.value.pendingDraft != null) "点开悬浮待发栏，改字后再发送；挂断会取消"
                 else if (config.listenOnly) {
                 if (config.speech.wholeReplyTts) "在 Operit 打字，整条回复写完后朗读" else "在 Operit 打字，回复生成时陆续朗读"
             } else "轻触返回；挂断结束语音会话").setOngoing(true).setContentIntent(open)
             .apply {
                 if (mutableState.value.pendingDraft != null)
                     addAction(android.R.drawable.ic_menu_edit, "编辑草稿", open)
-                if (config.listenOnly) addAction(android.R.drawable.ic_media_pause, "停止播放",
+                if (probing) { /* Only the Stop action below owns a diagnostic session. */ }
+                else if (config.listenOnly) addAction(android.R.drawable.ic_media_pause, "停止播放",
                     PendingIntent.getService(this@VoiceService, 3, Intent(this@VoiceService, VoiceService::class.java)
                         .setAction(INTERRUPT), PendingIntent.FLAG_IMMUTABLE))
                 else addAction(android.R.drawable.ic_btn_speak_now, if (mic) "关麦" else "开麦", toggle)
@@ -534,6 +736,7 @@ class VoiceService : Service() {
     }
 
     override fun onDestroy() {
+        if (probing) CaptureProbe.finish(probeOutcome ?: "测试已停止，已录完的样本保留。")
         started = false
         if (activeService === this) activeService = null
         overlay?.hide(); overlay = null
@@ -542,6 +745,7 @@ class VoiceService : Service() {
         conversation?.interrupt()
         runCatching { recorder?.close() }
         scope.cancel()
+        replay?.stop(); replay=null
         bridge?.close()
         runCatching { stopPlayer() }
         releaseAudio()
@@ -554,6 +758,8 @@ class VoiceService : Service() {
     }
 
     companion object {
+        const val PROBE = "com.huigu.phone10.mobile.CAPTURE_PROBE"
+        const val PROBE_PLAY = "com.huigu.phone10.mobile.CAPTURE_PROBE_PLAY"
         private var latestSynthesisOwner: Any? = null
         private var activeService: VoiceService? = null
         fun editPendingDraft(id: String, text: String): Boolean =
@@ -564,6 +770,10 @@ class VoiceService : Service() {
             activeService?.takeIf { it.started }?.conversation?.cancelDraft(id) == true
         fun showPendingDraft(): Boolean = activeService?.takeIf { it.started }?.revealPendingDraft() == true
         const val VOICE_INTERRUPTION = "com.huigu.phone10.mobile.VOICE_INTERRUPTION"
+        const val REPLAY = "com.huigu.phone10.mobile.REPLAY"
+        const val REPLAY_PAUSE = "com.huigu.phone10.mobile.REPLAY_PAUSE"
+        const val REPLAY_SEEK = "com.huigu.phone10.mobile.REPLAY_SEEK"
+        const val REPLAY_STOP = "com.huigu.phone10.mobile.REPLAY_STOP"
         const val INTERRUPT = "com.huigu.phone10.mobile.INTERRUPT"
         const val SHOW_DRAFT = "com.huigu.phone10.mobile.SHOW_DRAFT"
         const val REVIEW_PERMISSION_REQUEST = "com.huigu.phone10.mobile.REVIEW_PERMISSION_REQUEST"
@@ -577,5 +787,7 @@ class VoiceService : Service() {
         private const val DRAFT_NOTIFICATION = 32
         private val mutableState = MutableStateFlow(VoiceState())
         val state = mutableState.asStateFlow()
+        private val mutableReplay = MutableStateFlow(ClipReplayState())
+        internal val replayState = mutableReplay.asStateFlow()
     }
 }

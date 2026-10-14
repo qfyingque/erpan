@@ -1,0 +1,28 @@
+{
+  "model": "YAMNet (Google / TensorFlow), ONNX conversion by zeropointnine",
+  "license": "Apache-2.0",
+  "revision": "ac2ca3bd45d12ec1f19f1144205ea529b4e9dedf",
+  "files": [
+    {
+      "path": "models/yamnet.onnx",
+      "url": "https://huggingface.co/zeropointnine/yamnet-onnx/resolve/ac2ca3bd45d12ec1f19f1144205ea529b4e9dedf/yamnet.onnx",
+      "sha256": "1510041dce24a2e9e84ec546807ac408ae496da6d1ed41bc3ccba649623f8e19",
+      "bytes": 16093603,
+      "metadata": {}
+    },
+    {
+      "path": "models/yamnet_class_map.csv",
+      "url": "https://huggingface.co/zeropointnine/yamnet-onnx/resolve/ac2ca3bd45d12ec1f19f1144205ea529b4e9dedf/yamnet_class_map.csv",
+      "sha256": "cdf24d193e196d9e95912a2667051ae203e92a2ba09449218ccb40ef787c6df2",
+      "bytes": 14096,
+      "metadata": {}
+    },
+    {
+      "path": "models/README.md",
+      "url": "https://huggingface.co/zeropointnine/yamnet-onnx/resolve/ac2ca3bd45d12ec1f19f1144205ea529b4e9dedf/README.md",
+      "sha256": "7623bebe52dbcc66526447e5c8649f7087545b07596651c47f2778f80be1c73e",
+      "bytes": 285,
+      "metadata": {}
+    }
+  ]
+}

@@ -13,8 +13,8 @@ android {
         applicationId = "com.huigu.phone10.mobile"
         minSdk = 26
         targetSdk = 36
-        versionCode = 54
-        versionName = "0.3.23-preview"
+        versionCode = 68
+        versionName = "0.3.37-preview"
     }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_1_8
@@ -35,6 +35,8 @@ dependencies {
     implementation(libs.okhttp)
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.2")
     implementation("com.github.gkonovalov.android-vad:silero:2.0.10")
+    // Reuse the runtime already present through Silero; no second inference runtime.
+    implementation(libs.onnxruntime.android)
     implementation("io.coil-kt:coil:2.7.0")
     implementation("io.coil-kt:coil-gif:2.7.0")
     testImplementation(libs.junit)

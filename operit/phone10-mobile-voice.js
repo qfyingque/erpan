@@ -44,6 +44,8 @@ function observe(request, env, emit) {
     // O kept a failed/aborted partial turn: never read it later as a new completed reply.
     cursor = Math.max(cursor,messages[messages.length-1]?.timestamp || 0);
   }
+  const roles = [...new Set(messages.filter(m=>m.sender==='ai' && typeof m.roleName==='string').map(m=>m.roleName.trim()).filter(n=>n && n.length<=256))];
+  const roleName = m => typeof m.roleName==='string' && m.roleName.length<=256 ? m.roleName.trim() : '';
   const streaming = request.kind === 'observe_stream';
   const failed = status.state === 'error' || finalStatus.state === 'error';
   if (streaming && failed) cursor = Math.max(cursor,messages[messages.length-1]?.timestamp || 0);
@@ -63,7 +65,7 @@ function observe(request, env, emit) {
           notice = 'MESSAGE_TOO_LARGE';
           cursor = m.timestamp;
         } else {
-          if (!emit('message_start',{timestamp:m.timestamp,finished})) return;
+          if (!emit('message_start',{timestamp:m.timestamp,finished,roleName:roleName(m)})) return;
           for (let i=0;i<m.content.length;i+=8192)
             if (!emit('chunk',{text:m.content.slice(i,i+8192)})) return;
           if (!emit('message_end')) return;
@@ -71,7 +73,7 @@ function observe(request, env, emit) {
         }
       } else if (ready) cursor = Math.max(cursor,messages[messages.length-1]?.timestamp || 0);
     }
-    if (emit('snapshot',{cursor,processing:!ready,streaming:true,paged:true,failed,...(notice?{notice}:{})})) emit('complete');
+    if (emit('snapshot',{roleMetadata:true,roles,cursor,processing:!ready,streaming:true,paged:true,failed,...(notice?{notice}:{})})) emit('complete');
     return;
   }
   if ((ready || (streaming && !failed)) && request.after != null) {
@@ -84,12 +86,12 @@ function observe(request, env, emit) {
       if (m.sender !== 'ai' || !m.content.trim()) continue;
       count += m.content.length;
       if (count > 60000) throw Error('RESPONSE_TOO_LARGE');
-      if (!emit('message_start',{timestamp:m.timestamp,...(streaming?{finished:ready}:{})})) return;
+      if (!emit('message_start',{timestamp:m.timestamp,roleName:roleName(m),...(streaming?{finished:ready}:{})})) return;
       for (let i=0;i<m.content.length;i+=8192) if (!emit('chunk',{text:m.content.slice(i,i+8192)})) return;
       if (!emit('message_end')) return;
     }
   }
-  if (emit('snapshot',{cursor,processing:!ready,...(streaming?{streaming:true,failed}:{})})) emit('complete');
+  if (emit('snapshot',{roleMetadata:true,roles,cursor,processing:!ready,...(streaming?{streaming:true,failed}:{})})) emit('complete');
   }
 
 // Host-independent protocol core. emit is synchronous because the JS streaming
@@ -236,7 +238,7 @@ function readMainMessages(context, chatId) {
     if (!result.getSuccess()) throw Error('OPERIT_OBSERVE_FAILED');
     const data = result.getResult();
     return {chatId:data.getChatId(),messages:data.getMessages().map(m => ({
-      timestamp:m.getTimestamp(),sender:m.getSender(),content:m.getContent()
+      timestamp:m.getTimestamp(),sender:m.getSender(),content:m.getContent(),roleName:String(m.getRoleName() || '')
     }))};
   } catch (_) { throw Error('OPERIT_OBSERVE_FAILED'); }
 }

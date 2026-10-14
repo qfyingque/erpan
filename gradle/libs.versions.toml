@@ -17,6 +17,7 @@ timberkt = "1.5.1"
 navigationCompose = "2.9.5"
 
 [libraries]
+onnxruntime-android = { module = "com.microsoft.onnxruntime:onnxruntime-android", version = "1.22.0" }
 accompanist-permissions = { module = "com.google.accompanist:accompanist-permissions", version.ref = "accompanistPermissions" }
 androidx-constraintlayout-compose = { module = "androidx.constraintlayout:constraintlayout-compose", version.ref = "constraintlayoutCompose" }
 androidx-core-ktx = { group = "androidx.core", name = "core-ktx", version.ref = "coreKtx" }

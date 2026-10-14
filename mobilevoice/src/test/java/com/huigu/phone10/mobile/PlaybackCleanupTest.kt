@@ -23,7 +23,8 @@ class PlaybackCleanupTest {
                             finishFocus = { events += "focus" },
                             clearPlayer = { events += "reference" },
                             closePlayer = { events += "close" },
-                            clearVisual = { events += "visual:${Thread.currentThread().name}" })
+                            clearVisual = { events += "visual:${Thread.currentThread().name}" },
+                            finishArchive = { delay(1); events += "archive" })
                     }
                 } catch (_: CancellationException) { }
             }
@@ -31,7 +32,8 @@ class PlaybackCleanupTest {
             job.cancelAndJoin()
             assertEquals(listOf("focus", "reference", "close"), events.take(3))
             assertTrue(events.single { it.startsWith("visual:") }.startsWith("visual:visual-dispatcher"))
-            assertEquals(4, events.size)
+            assertEquals(5, events.size)
+            assertEquals("archive",events.last())
         } finally { visual.close() }
     }
 
@@ -45,10 +47,10 @@ class PlaybackCleanupTest {
                         finishFocus = { events += "focus"; error("focus") },
                         clearPlayer = { events += "reference" },
                         closePlayer = { events += "close" },
-                        clearVisual = { events += "visual" })
+                        clearVisual = { events += "visual" }, finishArchive = { events += "archive" })
                 }
             }
-            assertEquals(listOf("focus", "reference", "close", "visual"), events)
+            assertEquals(listOf("focus", "reference", "close", "visual", "archive"), events)
         } finally { visual.close() }
     }
 }

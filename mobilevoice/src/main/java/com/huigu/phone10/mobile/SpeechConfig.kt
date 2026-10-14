@@ -14,10 +14,12 @@ data class SpeechConfig(val sttBaseUrl: String, val sttKey: String, val sttModel
     // Gson leaves fields absent from older encrypted settings null.
     val isBailian: Boolean get() = provider == BAILIAN
     val effectiveTtsProvider: String get() = ttsProvider ?: provider ?: OPENAI
+    val elevenDialogueTts: Boolean get() = effectiveTtsProvider == ELEVENLABS && ttsModel == "eleven_v4_turbo"
+    val elevenHttpTts: Boolean get() = effectiveTtsProvider == ELEVENLABS && ttsModel in setOf("eleven_v3", "eleven_v4")
     val streamingTts: Boolean get() = effectiveTtsProvider in setOf(BAILIAN, MINIMAX, VOLCENGINE, QWEN_LOCAL) ||
-        (effectiveTtsProvider == ELEVENLABS && ttsModel == "eleven_flash_v2_5")
+        (effectiveTtsProvider == ELEVENLABS && ttsModel == "eleven_flash_v2_5") || elevenDialogueTts
     val sentenceHttpTts: Boolean get() = effectiveTtsProvider == MOSSLAND ||
-        (effectiveTtsProvider == ELEVENLABS && ttsModel == "eleven_v3")
+        elevenHttpTts
     val effectiveVolcResource: String get() = volcResource ?: "seed-icl-2.0"
     val effectiveSttVolcResource: String get() = sttVolcResource ?: "volc.seedasr.sauc.duration"
     val effectiveMossSpeed: Double get() = mossSpeed ?: 1.0
@@ -112,7 +114,8 @@ data class SpeechConfig(val sttBaseUrl: String, val sttKey: String, val sttModel
             // Named voice capabilities belong to the local server, not to a fixed client alias.
         }
         if (effectiveTtsProvider == ELEVENLABS) {
-            if (ttsModel !in setOf("eleven_flash_v2_5", "eleven_v3")) add("ElevenLabs 模型：请选择 Flash v2.5 或 v3。")
+            if (ttsModel !in setOf("eleven_flash_v2_5", "eleven_v3", "eleven_v4", "eleven_v4_turbo"))
+                add("ElevenLabs 模型：请选择 Flash v2.5、v3、v4 或 v4 Turbo。")
             if (!Regex("[A-Za-z0-9_-]{1,128}").matches(voice)) add("ElevenLabs 音色：请填写平台提供的 Voice ID，不是名称或网址。")
         }
         if (effectiveTtsProvider == MOSSLAND && effectiveMossTextMode !in setOf("fast", "coherent", "whole"))
@@ -153,11 +156,15 @@ data class SpeechConfig(val sttBaseUrl: String, val sttKey: String, val sttModel
         require(url.host == "api.elevenlabs.io" && url.port == 443 && url.encodedPath.trimEnd('/') == "/v1") {
             "ElevenLabs 官方地址请填写 https://api.elevenlabs.io/v1。"
         }
-        return url.newBuilder().encodedPath("/v1/text-to-speech").addPathSegment(voice)
-            .addPathSegment(if (ttsModel == "eleven_v3") "stream" else "stream-input")
+        val route = if (elevenDialogueTts) url.newBuilder().encodedPath("/v1/text-to-dialogue/stream-input")
+            else url.newBuilder().encodedPath("/v1/text-to-speech").addPathSegment(voice)
+                .addPathSegment(if (elevenHttpTts) "stream" else "stream-input")
+        return route
             .addQueryParameter("output_format", "pcm_24000").apply {
-                if (ttsModel != "eleven_v3") {
+                if (!elevenHttpTts) {
                     addQueryParameter("model_id", ttsModel)
+                }
+                if (ttsModel == "eleven_flash_v2_5") {
                     addQueryParameter("inactivity_timeout", "180")
                     addQueryParameter("auto_mode", "true")
                 }

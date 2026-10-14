@@ -27,6 +27,8 @@ data class MobileSettings(
     val captionsEnabled: Boolean = false,
     val listenOnly: Boolean = false,
     val confirmBeforeSend: Boolean = false,
+    val roleVoiceBindings: List<RoleVoiceBinding>? = null,
+    val preserveBreath: Boolean = false,
 )
 
 /** User-owned credentials stay encrypted in this app's non-backup storage. */

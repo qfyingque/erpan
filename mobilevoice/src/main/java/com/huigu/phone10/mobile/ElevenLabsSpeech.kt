@@ -1,6 +1,7 @@
 package com.huigu.phone10.mobile
 
 import com.google.gson.JsonObject
+import com.google.gson.JsonArray
 import com.google.gson.JsonParser
 import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.Channel
@@ -10,7 +11,7 @@ import okio.ByteString
 import java.util.Base64
 import java.util.concurrent.atomic.AtomicBoolean
 
-/** Official Flash TTS socket: one reply, one owner, no replay after failure. */
+/** Official Flash TTS / v4 Turbo dialogue socket: one reply, one owner, no replay. */
 internal class ElevenLabsSpeech(private val config: SpeechConfig, private val sockets: WebSocket.Factory,
     private val timeoutMillis: Long = 1_800_000, private val heartbeatMillis: Long = 15_000) {
     suspend fun speakStream(texts: ReceiveChannel<String>, onPcm: (ByteArray) -> Unit) {
@@ -51,18 +52,29 @@ internal class ElevenLabsSpeech(private val config: SpeechConfig, private val so
         var socket: WebSocket? = null
         var input: Job? = null
         try {
+            val dialogue = config.elevenDialogueTts
             val ws = sockets.newWebSocket(Request.Builder().url(config.elevenEndpoint().toString().replaceFirst("https://", "wss://"))
                 .header("xi-api-key", config.ttsKey).build(), listener).also { socket = it }
-            fun send(text: String) {
-                val json = JsonObject().apply { addProperty("text", text) }
+            fun send(json: JsonObject) {
                 if (!ws.send(json.toString())) throw SpeechApiException("ElevenLabs 文字发送失败，本轮不会自动重发。")
             }
-            send(" ")
+            fun legacyText(text: String) = send(JsonObject().apply { addProperty("text", text) })
+            fun control(name: String) = send(JsonObject().apply { addProperty(name, true) })
+            if (dialogue) send(JsonObject().apply { add("voices", JsonArray().apply { add(config.voice) }) })
+            else legacyText(" ")
             val inputFinished = AtomicBoolean(false)
             input = launch {
                 var characters = 0
+                var pending = 0
+                var firstFlush = true
+                fun flush() {
+                    control("flush")
+                    pending = 0
+                    firstFlush = false
+                }
                 suspend fun append(text: String) {
-                    if (text.isBlank()) return
+                    // Dialogue input is verbatim: token fragments must not gain or lose spaces.
+                    if (text.isEmpty() || (!dialogue && text.isBlank())) return
                     characters += text.codePointCount(0, text.length)
                     require(characters <= 40_000) { "ElevenLabs 单条回复过长。" }
                     var begin = 0
@@ -71,20 +83,34 @@ internal class ElevenLabsSpeech(private val config: SpeechConfig, private val so
                         if (end < text.length && text[end - 1].isHighSurrogate()) end--
                         while (ws.queueSize() > 262_144) { delay(10); ensureActive() }
                         val part = text.substring(begin, end)
-                        send(if (part.endsWith(' ')) part else "$part ")
+                        if (dialogue) {
+                            send(JsonObject().apply { add("inputs", JsonArray().apply {
+                                add(JsonObject().apply { addProperty("text", part); addProperty("voice_id", config.voice) })
+                            }) })
+                            pending += part.codePointCount(0, part.length)
+                            val boundary = part.any { it in "，。！？；：、,.!?;:\n" }
+                            // First clause starts promptly. Later clauses retain more context in this same socket.
+                            if ((boundary && (firstFlush || pending >= 80)) || pending >= 160) flush()
+                        } else legacyText(if (part.endsWith(' ')) part else "$part ")
                         begin = end
                     }
                 }
                 append(first)
                 while (true) {
                     // A tool pause is not end of input. Only this producer writes to the socket.
-                    val next = withTimeoutOrNull(heartbeatMillis) { texts.receiveCatching() }
-                    if (next == null) { send(" "); continue }
+                    val wait = if (dialogue && pending > 0) minOf(500L, heartbeatMillis) else heartbeatMillis
+                    val next = withTimeoutOrNull(wait) { texts.receiveCatching() }
+                    if (next == null) {
+                        if (dialogue) { if (pending > 0) flush() else control("keep_alive") }
+                        else legacyText(" ")
+                        continue
+                    }
                     next.exceptionOrNull()?.let { throw it }
                     val text = next.getOrNull() ?: break
                     append(text)
                 }
-                inputFinished.set(true); send("")
+                inputFinished.set(true)
+                if (dialogue) control("close_socket") else legacyText("")
             }
             var carry: Byte? = null
             var total = 0L
@@ -101,7 +127,8 @@ internal class ElevenLabsSpeech(private val config: SpeechConfig, private val so
                     carry = if (even != aligned.size) aligned.last() else null
                     if (even > 0) runInterruptible { onPcm(aligned.copyOf(even)) }
                 }
-                if (json["isFinal"]?.asBoolean == true) {
+                // A dialogue turn marker is not session completion; queued text/audio still belongs here.
+                if (json[if (dialogue) "is_final" else "isFinal"]?.asBoolean == true) {
                     require(inputFinished.get() && total > 0 && carry == null)
                     return@coroutineScope
                 }

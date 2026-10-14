@@ -6,6 +6,7 @@ import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.MediaRecorder
 import android.media.audiofx.AcousticEchoCanceler
+import android.media.audiofx.AutomaticGainControl
 import android.media.audiofx.AudioEffect
 import android.media.audiofx.NoiseSuppressor
 import com.konovalov.vad.silero.VadSilero
@@ -23,7 +24,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 
 class UtteranceTooLongException : IllegalStateException("一句话超过30秒，请停顿后重新开麦。")
 
-class PcmRecorder(context: Context) {
+class PcmRecorder(context: Context, private val preserveBreath: Boolean = false) {
     private val context = context.applicationContext
     private val closed = AtomicBoolean(false)
     private val started = AtomicBoolean(false)
@@ -33,26 +34,18 @@ class PcmRecorder(context: Context) {
 
     @SuppressLint("MissingPermission") // Foreground owner checks RECORD_AUDIO before invoking run.
     suspend fun run(onSpeechStart: () -> Unit, onUtterance: (ByteArray) -> Unit, onReady: () -> Unit = {},
-                    acceptInput: () -> Boolean = { true }) = withContext(Dispatchers.IO) {
+                    acceptInput: () -> Boolean = { true },
+                    acceptSound: () -> Boolean = { false }, onSound: (SoundCue) -> Unit = {},
+                    onSoundStatus: (Boolean) -> Unit = {}) = withContext(Dispatchers.IO) {
         check(started.compareAndSet(false, true)) { "录音已启动。" }
+        val analyzer = if (preserveBreath) SoundCueAnalyzer(context, this,
+            { !closed.get() && acceptSound() }, onSound, onSoundStatus) else null
         try {
             // Segmentation below owns minimum speech and trailing silence exactly once.
             VadSilero(context, SampleRate.SAMPLE_RATE_16K, FrameSize.FRAME_SIZE_512,
                 Mode.NORMAL, 0, 0).use { vad ->
-                synchronized(lock) {
-                    if (closed.get()) return@withContext
-                    record = AudioRecord.Builder().setAudioSource(MediaRecorder.AudioSource.VOICE_COMMUNICATION)
-                        .setAudioFormat(AudioFormat.Builder().setSampleRate(16_000)
-                            .setChannelMask(AudioFormat.CHANNEL_IN_MONO).setEncoding(AudioFormat.ENCODING_PCM_16BIT).build())
-                        .setBufferSizeInBytes(maxOf(4096, AudioRecord.getMinBufferSize(16_000,
-                            AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT))).build()
-                    val input = requireNotNull(record)
-                    check(input.state == AudioRecord.STATE_INITIALIZED) { "无法初始化麦克风。" }
-                    if (AcousticEchoCanceler.isAvailable()) enableEffect { AcousticEchoCanceler.create(input.audioSessionId) }
-                    if (NoiseSuppressor.isAvailable()) enableEffect { NoiseSuppressor.create(input.audioSessionId) }
-                    input.startRecording()
-                    check(input.recordingState == AudioRecord.RECORDSTATE_RECORDING) { "无法开始录音。" }
-                }
+                openInput(if (preserveBreath) MediaRecorder.AudioSource.VOICE_RECOGNITION
+                    else MediaRecorder.AudioSource.VOICE_COMMUNICATION, true, !preserveBreath, preserveBreath)
                 onReady()
                 val frame = ByteArray(1024)
                 var filled = 0
@@ -67,20 +60,74 @@ class PcmRecorder(context: Context) {
                     if (count == 0) { delay(5); continue }
                     filled += count
                     if (filled == frame.size) {
+                        analyzer?.accept(frame)
                         val speech = vad.isSpeech(frame)
                         if (!closed.get()) segmenter.accept(frame, speech, onSpeechStart, onUtterance, acceptInput())
                         filled = 0
                     }
                 }
             }
+        } finally { close(); withContext(kotlinx.coroutines.NonCancellable) { analyzer?.close() } }
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun openInput(source: Int, echo: Boolean, noise: Boolean, disableGain: Boolean) {
+        synchronized(lock) {
+                    if (closed.get()) throw kotlinx.coroutines.CancellationException("Recorder closed")
+                    record = AudioRecord.Builder().setAudioSource(source)
+                        .setAudioFormat(AudioFormat.Builder().setSampleRate(16_000)
+                            .setChannelMask(AudioFormat.CHANNEL_IN_MONO).setEncoding(AudioFormat.ENCODING_PCM_16BIT).build())
+                        .setBufferSizeInBytes(maxOf(4096, AudioRecord.getMinBufferSize(16_000,
+                            AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT))).build()
+                    val input = requireNotNull(record)
+                    check(input.state == AudioRecord.STATE_INITIALIZED) { "无法初始化麦克风。" }
+                    if (AcousticEchoCanceler.isAvailable()) configureEffect(echo) { AcousticEchoCanceler.create(input.audioSessionId) }
+                    if (NoiseSuppressor.isAvailable()) configureEffect(noise) { NoiseSuppressor.create(input.audioSessionId) }
+                    if (disableGain && AutomaticGainControl.isAvailable()) configureEffect(false) { AutomaticGainControl.create(input.audioSessionId) }
+                    input.startRecording()
+                    check(input.recordingState == AudioRecord.RECORDSTATE_RECORDING) { "无法开始录音。" }
+                }
+    }
+
+    /** Capture the bytes before VAD/model gates, with no transcription or network calls. */
+    internal suspend fun probe(minimal: Boolean, progress: (Int) -> Unit): Pair<ByteArray, String> = withContext(Dispatchers.IO) {
+        check(started.compareAndSet(false, true)) { "录音已启动。" }
+        val manager = context.getSystemService(Context.AUDIO_SERVICE) as android.media.AudioManager
+        val supportsRaw = manager.getProperty(android.media.AudioManager.PROPERTY_SUPPORT_AUDIO_SOURCE_UNPROCESSED) == "true"
+        val source = if (minimal && supportsRaw) MediaRecorder.AudioSource.UNPROCESSED else MediaRecorder.AudioSource.VOICE_RECOGNITION
+        try {
+            openInput(source, echo = !minimal, noise = false, disableGain = true)
+            val details = synchronized(lock) {
+                val input = requireNotNull(record)
+                "requestedSource=$source; actualSource=${input.audioSource}; unprocessedAdvertised=$supportsRaw; " +
+                    "mode=${manager.mode}; rate=${input.sampleRate}; deviceType=${input.routedDevice?.type}; " +
+                    effects.joinToString { effect -> runCatching { "${effect.javaClass.simpleName}:enabled=${effect.enabled},control=${effect.hasControl()}" }.getOrDefault("effect_state_unavailable") }
+            }
+            val pcm = ByteArray(16000 * 2 * 8)
+            var used = 0
+            var lastSecond = -1
+            kotlinx.coroutines.withTimeout(15000) {
+                while (used < pcm.size && !closed.get()) {
+                    currentCoroutineContext().ensureActive()
+                    val n = synchronized(lock) { record?.read(pcm, used, minOf(2048,pcm.size-used), AudioRecord.READ_NON_BLOCKING) ?: 0 }
+                    check(n >= 0) { "麦克风读取失败。" }
+                    if (n == 0) { delay(5); continue }
+                    used += n
+                    val second = used / 32000
+                    if (second != lastSecond) { lastSecond = second; progress(second) }
+                }
+            }
+            currentCoroutineContext().ensureActive()
+            check(used == pcm.size) { "收音已取消。" }
+            pcm to (details + synchronized(lock) { "; deviceTypeEnd=${record?.routedDevice?.type}" })
         } finally { close() }
     }
 
-    private fun enableEffect(create: () -> AudioEffect?) {
+    private fun configureEffect(enabled: Boolean, create: () -> AudioEffect?) {
         // OEMs can advertise an effect and still refuse creation for this audio session.
         val effect = try { create() } catch (_: RuntimeException) { null } ?: return
         effects.add(effect)
-        try { effect.enabled = true } catch (_: RuntimeException) { /* Device effect is optional. */ }
+        try { effect.enabled = enabled } catch (_: RuntimeException) { /* Device effect is optional. */ }
     }
 
     fun close() {

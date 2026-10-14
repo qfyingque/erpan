@@ -75,7 +75,9 @@ class VoiceConversationTest {
         assertTrue(first.isCancelled)
         val second = flow.submit(byteArrayOf(2)); begun.receive()
         flow.setVoiceInterruptionEnabled(true)
-        flow.speechStarted(); second.join()
+        flow.speechStarted()
+        assertTrue(second.isActive)
+        flow.interrupt(); second.join()
         assertTrue(second.isCancelled)
     }
 

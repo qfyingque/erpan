@@ -40,8 +40,17 @@ class SpeechText(private val preserveSpacing: Boolean = false,
 
     fun flushReady(): List<String> {
         val deadline = if (coherentMode) { if (emitted) 5000 else 2500 } else if (firstClauseMode || sentenceMode) 1500 else if (emitted) 400 else 150
-        return if (firstAt?.let { nowMillis() - it >= deadline } == true) flush() else emptyList()
+        if (firstAt?.let { nowMillis() - it >= deadline } != true) return emptyList()
+        // A timer or tool pause does not mean the incoming word is complete.
+        // Independent local requests must only consume complete clauses here.
+        if (firstClauseMode && !coherentMode) {
+            val end = lastClauseEnd()
+            return if (end > 0) listOfNotNull(emit(end).takeIf { it.isNotEmpty() }) else emptyList()
+        }
+        return flush()
     }
+
+    private fun lastClauseEnd(): Int = pending.indexOfLast { it in "，。！？；：,.!?;:\n" } + 1
 
     private fun visible(char: Char, output: MutableList<String>) {
         if (hidden.isNotEmpty()) return
@@ -55,28 +64,32 @@ class SpeechText(private val preserveSpacing: Boolean = false,
                 (char in "，；：,;:" && points >= 240) ||
                 (points >= 300 && !char.isHighSurrogate())
         } else if (firstClauseMode) {
-            // First punctuation wins, even for a short greeting. Later requests
-            // carry more context; the timer also drains text before a tool wait.
+            // First punctuation wins. Later clauses are grouped, but reaching
+            // the old 240-character target must not cut a word in half.
             (char in "，。！？；：,.!?;:\n" && (!emitted || pending.length >= 100)) ||
-                (pending.length >= 240 && !char.isHighSurrogate())
+                (pending.codePointCount(0, pending.length) >= 600 && !char.isHighSurrogate())
         } else if (sentenceMode) {
             // Keep tiny introductions attached to the following phrase, and let
             // complete clauses provide context to independent HTTP synthesis.
             (char in "。！？.!?\n" && pending.length >= 8) ||
                 (char in "，；：,;:" && pending.length >= 24) || pending.length >= 100
         } else char in "，。！？；：,.!?;:\n" || pending.length >= 180
-        if (boundary) emit().takeIf { it.isNotEmpty() }?.let(output::add)
+        if (boundary) {
+            val end = if (firstClauseMode && !coherentMode) lastClauseEnd().takeIf { it > 0 } ?: pending.length
+                else pending.length
+            emit(end).takeIf { it.isNotEmpty() }?.let(output::add)
+        }
     }
 
-    private fun emit(): String {
+    private fun emit(end: Int = pending.length): String {
         // A streamed delta may stop between an emoji's UTF-16 code units.
-        val count = if ((firstClauseMode || coherentMode) && pending.isNotEmpty() && pending.last().isHighSurrogate())
-            pending.length - 1 else pending.length
+        val count = if ((firstClauseMode || coherentMode) && end > 0 && pending[end - 1].isHighSurrogate())
+            end - 1 else end
         val cleaned = pending.substring(0, count).replace(Regex("[`*_#]"), "")
             .replace(Regex("\\s+"), " ")
         val text = if (preserveSpacing && cleaned.isNotBlank()) cleaned else cleaned.trim()
         pending.delete(0, count)
-        firstAt = if (pending.isEmpty()) null else nowMillis()
+        firstAt = if (pending.isEmpty()) null else if (firstClauseMode && !coherentMode) firstAt else nowMillis()
         if (text.isNotEmpty()) emitted = true
         return text
     }

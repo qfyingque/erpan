@@ -147,11 +147,13 @@ import java.util.Locale
             }
             else if (ttsProvider == SpeechConfig.ELEVENLABS) {
                 ProviderField("合成模型", speech.ttsModel, enabled, listOf(
-                    "eleven_flash_v2_5" to "Flash v2.5 · 边写边说", "eleven_v3" to "v3 · 分段朗读")) {
+                    "eleven_flash_v2_5" to "Flash v2.5 · 边写边说", "eleven_v3" to "v3 · 分段朗读",
+                    "eleven_v4_turbo" to "v4 Turbo · 边写边说", "eleven_v4" to "v4 · 分段朗读")) {
                     onChange(settings.copy(speech = speech.copy(ttsModel = it)))
                 }
-                Hint(if (speech.streamingTts) "陆续发送回复文字，收到声音就播放；实际出声时间取决于网络与平台。"
-                    else "把回复分段交给 v3 合成，音频边生成边播放。各段独立生成，句间听感可能不同。")
+                Hint(if (speech.elevenDialogueTts) "陆续发送回复文字，首个断句标点触发生成；工具等待时保持连接，收到声音就播放。实际出声时间取决于网络与平台。"
+                    else if (speech.streamingTts) "陆续发送回复文字，收到声音就播放；实际出声时间取决于网络与平台。"
+                    else "把回复分段交给所选模型合成，音频边生成边播放。各段独立生成，句间听感可能不同。")
             }
             else FormField("合成模型", speech.ttsModel, enabled) { onChange(settings.copy(speech = speech.copy(ttsModel = it.trim()))) }
             Column(Modifier.bringIntoViewRequester(voiceTarget), verticalArrangement = Arrangement.spacedBy(15.dp)) {

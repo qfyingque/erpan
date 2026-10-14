@@ -8,12 +8,14 @@ class SpeechTranscript(
     val text: String,
     private val spans: List<Pair<Long, Long>> = emptyList(),
     private val emotions: Map<String, Double> = emptyMap(),
+    private val soundCue: SoundCue? = null,
 ) {
+    fun withSoundCue(cue: SoundCue?) = SpeechTranscript(text, spans, emotions, cue)
     /** Provider timing applies only to the recognized words, never to a changed message. */
     fun withText(edited: String): SpeechTranscript =
         if (edited.trim() == text.trim()) this else SpeechTranscript(edited.trim())
     fun forChat(includeVoiceHints: Boolean = ENABLE_VOICE_HINTS): String {
-        val spoken = text.trim()
+        val spoken = listOfNotNull(text.trim().takeIf { it.isNotEmpty() }, soundCue?.message()).joinToString("\n\n")
         if (!includeVoiceHints || spoken.isEmpty()) return spoken
         val hints = mutableListOf<String>()
         val ordered = spans.sortedBy { it.first }

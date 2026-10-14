@@ -63,6 +63,26 @@ internal class FloatingCaptions(context: Context, onVisible: (Boolean) -> Unit,
     private var resizeHandle: View? = null
     private var params: WindowManager.LayoutParams? = null
     private var expanded = true
+    private var movieView: MovieCaptionText? = null
+    private val appearanceStore = CaptionAppearanceStore(app)
+    private var appearance = appearanceStore.load()
+    private var movieMode = appearance.transparent
+    private val appearanceListener = android.content.SharedPreferences.OnSharedPreferenceChangeListener { _, _ ->
+        handler.post {
+            val next=appearanceStore.load()
+            if (next.transparent != appearance.transparent) { movieMode=next.transparent;expanded=true }
+            appearance = next
+            movieView?.appearance = appearance
+            (body as? MovieCaptionText)?.appearance = appearance
+            resize(); paint(); scrollToPlaying()
+        }
+    }
+    private var movieX = preferencesPosition("movie-x")
+    private var movieY = preferencesPosition("movie-y")
+    private fun preferencesPosition(key: String): Float = runCatching {
+        app.getSharedPreferences("caption-window", Context.MODE_PRIVATE).getFloat(key, Float.NaN)
+    }.getOrDefault(Float.NaN)
+    private fun showingMovie() = movieMode && review.draftId == null
     private val inputFocus = CaptionInputFocus()
     private val editing get() = inputFocus.active
     private var applyingText = false
@@ -85,6 +105,8 @@ internal class FloatingCaptions(context: Context, onVisible: (Boolean) -> Unit,
             handler.removeCallbacks(repaint); pending = false
             inputFocus.release(); imeBottomPixels = 0
             binding.detach()
+            appearanceStore.preferences.unregisterOnSharedPreferenceChangeListener(appearanceListener)
+            movieView = null
             panel = null; header = null; body = null; scroll = null; contentArea = null
             followButton = null; paintedRange = null; paintRevision++
             reviewArea = null; reviewLabel = null; editor = null; sendButton = null
@@ -117,6 +139,8 @@ internal class FloatingCaptions(context: Context, onVisible: (Boolean) -> Unit,
     fun show(): Boolean {
         if (!Settings.canDrawOverlays(app)) { hide(); return false }
         if (lifecycle.visible) return true
+        appearance = appearanceStore.load()
+        movieMode = appearance.transparent
         val root = LinearLayout(app).apply {
             orientation = LinearLayout.VERTICAL
             background = GradientDrawable().apply {
@@ -130,7 +154,9 @@ internal class FloatingCaptions(context: Context, onVisible: (Boolean) -> Unit,
             setPadding(dp(14), 0, dp(12), 0)
             setOnClickListener {
                 if (expanded) releaseInputFocus()
-                expanded = !expanded; resize(); paint()
+                if (review.draftId == null && appearance.transparent) { movieMode = true; expanded = true }
+                else expanded = !expanded
+                resize(); paint()
                 if (expanded) {
                     if (review.draftId != null) binding.reveal() else scrollToPlaying()
                 }
@@ -208,8 +234,9 @@ internal class FloatingCaptions(context: Context, onVisible: (Boolean) -> Unit,
         actions.addView(cancel, LinearLayout.LayoutParams(0, dp(43), 1f))
         actions.addView(send, LinearLayout.LayoutParams(0, dp(43), 1f))
         draftArea.addView(actions, LinearLayout.LayoutParams(-1, dp(46)))
-        val content = TextView(app).apply {
-            textSize = 15f; setTextColor(Color.rgb(251, 245, 248))
+        val content = MovieCaptionText(app).apply {
+            appearance = this@FloatingCaptions.appearance
+            maxLines = Int.MAX_VALUE; ellipsize = null; gravity = Gravity.LEFT
             setPadding(dp(14), dp(3), dp(14), dp(50))
             setLineSpacing(dp(4).toFloat(), 1f)
         }
@@ -313,6 +340,16 @@ internal class FloatingCaptions(context: Context, onVisible: (Boolean) -> Unit,
                 resize(); rememberGeometry(); return true
             }
         }
+        val movie = MovieCaptionText(app).apply {
+            appearance = this@FloatingCaptions.appearance
+            contentDescription = "字幕；点开查看全文，拖动移动位置"
+            setOnClickListener {
+                movieMode = false; expanded = true; paintedRange = null
+                resize(); paint(); scrollToPlaying()
+            }
+        }
+        root.addView(movie, LinearLayout.LayoutParams(-1, -1))
+        movieView = movie
         root.addView(title, LinearLayout.LayoutParams(-1, dp(44)))
         root.addView(area, LinearLayout.LayoutParams(-1, dp(154)))
         val layout = WindowManager.LayoutParams(dp(286), -2,
@@ -343,6 +380,30 @@ internal class FloatingCaptions(context: Context, onVisible: (Boolean) -> Unit,
                     rememberGeometry(); true
                 }
                 MotionEvent.ACTION_CANCEL -> { gesture.cancel(); rememberGeometry(); true }
+                else -> false
+            }
+        }
+        val movieGesture = Phone10OverlayGesture(ViewConfiguration.get(app).scaledTouchSlop.toFloat())
+        var movieStartX = 0; var movieStartY = 0; var movieDownX = 0f; var movieDownY = 0f
+        movie.setOnTouchListener { _, event ->
+            when (event.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    movieStartX = layout.x; movieStartY = layout.y
+                    movieDownX = event.rawX; movieDownY = event.rawY
+                    movieGesture.down(event.rawX, event.rawY); true
+                }
+                MotionEvent.ACTION_MOVE -> {
+                    if (movieGesture.move(event.rawX, event.rawY)) {
+                        movieX = units(movieStartX + event.rawX - movieDownX)
+                        movieY = units(movieStartY + event.rawY - movieDownY)
+                        reposition()
+                    }; true
+                }
+                MotionEvent.ACTION_UP -> {
+                    if (movieGesture.up(event.rawX, event.rawY)) movie.performClick()
+                    preferences.edit().putFloat("movie-x", movieX).putFloat("movie-y", movieY).apply(); true
+                }
+                MotionEvent.ACTION_CANCEL -> { movieGesture.cancel(); true }
                 else -> false
             }
         }
@@ -388,6 +449,7 @@ internal class FloatingCaptions(context: Context, onVisible: (Boolean) -> Unit,
         try { manager.addView(root, layout) }
         catch (_: RuntimeException) { lifecycle.detached(); return false }
         lifecycle.attached { manager.removeView(root) }
+        appearanceStore.preferences.registerOnSharedPreferenceChangeListener(appearanceListener)
         paint()
         binding.attach(surface)
         return true
@@ -407,21 +469,34 @@ internal class FloatingCaptions(context: Context, onVisible: (Boolean) -> Unit,
     }
 
     private fun paint() {
+        val movie = showingMovie()
+        movieView?.visibility = if (movie) View.VISIBLE else View.GONE
+        header?.visibility = if (movie) View.GONE else View.VISIBLE
+        panel?.background = if (movie) null else GradientDrawable().apply {
+            setColor(Color.argb(240, 35, 32, 37)); cornerRadius = dp(14).toFloat()
+            setStroke(dp(1),Color.rgb(156,111,131))
+        }
+        movieView?.let { view ->
+            val nextMovie = movieCaption(text, status, playingRange, playbackTracking)
+            if (view.text.toString() != nextMovie) view.text = nextMovie
+        }
         val reviewing = review.draftId != null
         header?.text = when {
             reviewing && expanded -> "待发送 · 点此收起"
             reviewing -> "待发送 · 点开确认"
+            expanded && appearance.transparent -> "完整回复 · 点此返回字幕"
             expanded -> "AI 字幕 · 点此收起"
             else -> "字幕"
         }
         header?.contentDescription = if (expanded) "收起窗口；拖动可移动位置" else "展开窗口；拖动可移动位置"
-        contentArea?.visibility = if (expanded) View.VISIBLE else View.GONE
+        contentArea?.visibility = if (expanded && !showingMovie()) View.VISIBLE else View.GONE
         reviewArea?.visibility = if (reviewing) View.VISIBLE else View.GONE
         reviewLabel?.text = if (review.currentText.length > 4000)
             "待发送 · 请缩短到 4000 字以内" else "待发送 · 尚未提交给 Operit"
         sendButton?.isEnabled = review.canSend
         updateFollowButton()
         val next = text.ifBlank { status }
+        if (movie) return
         val range = playingRange?.takeIf { it.first >= 0 && it.last < next.length }
         if (body?.text?.toString() == next && paintedRange == range) return
         val moved = paintedRange != range
@@ -453,7 +528,7 @@ internal class FloatingCaptions(context: Context, onVisible: (Boolean) -> Unit,
     }
 
     private fun scrollToPlaying() {
-        if (!expanded || !follow.enabled || review.draftId != null) return
+        if (showingMovie() || !expanded || !follow.enabled || review.draftId != null) return
         val range = playingRange ?: return
         val target = body ?: return
         val scroller = scroll ?: return
@@ -470,10 +545,26 @@ internal class FloatingCaptions(context: Context, onVisible: (Boolean) -> Unit,
 
     private fun sizeAndClamp() {
         val layout = params ?: return
+        if (showingMovie()) {
+            val bounds = screen()
+            val width = ((bounds.right - bounds.left) - 24f).coerceAtLeast(1f)
+            // Include Android font scaling, three lines and outline padding in touch bounds.
+            val scaled = appearance.sizeSp * app.resources.displayMetrics.scaledDensity / app.resources.displayMetrics.density
+            val height = (scaled * 1.4f * 3 + 24f).coerceAtMost(bounds.bottom - bounds.top).coerceAtLeast(1f)
+            val x = if (movieX.isFinite()) movieX else bounds.left + 12f
+            val y = if (movieY.isFinite()) movieY else bounds.top + (bounds.bottom - bounds.top) * 0.73f
+            layout.width = pixels(width); layout.height = pixels(height)
+            layout.x = pixels(x.coerceIn(bounds.left, (bounds.right - width).coerceAtLeast(bounds.left)))
+            layout.y = pixels(y.coerceIn(bounds.top, (bounds.bottom - height).coerceAtLeast(bounds.top)))
+            movieView?.visibility = View.VISIBLE; header?.visibility = View.GONE
+            contentArea?.visibility = View.GONE
+            return
+        }
+        movieView?.visibility = View.GONE; header?.visibility = View.VISIBLE
         val visible = geometry.visible(screen(), expanded, review.draftId != null)
         layout.width = pixels(visible.width); layout.height = pixels(visible.height)
         contentArea?.layoutParams?.height = (layout.height - dp(44)).coerceAtLeast(1)
-        contentArea?.visibility = if (expanded) View.VISIBLE else View.GONE
+        contentArea?.visibility = if (expanded && !showingMovie()) View.VISIBLE else View.GONE
         layout.x = pixels(visible.x); layout.y = pixels(visible.y)
         contentArea?.requestLayout()
     }

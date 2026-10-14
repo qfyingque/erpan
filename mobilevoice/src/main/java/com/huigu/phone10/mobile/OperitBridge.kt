@@ -75,11 +75,12 @@ class OperitBridge(context: Context) : AutoCloseable {
         }
     }
 
-    internal suspend fun readReplies(chatId: String, after: Long?): ReplySnapshot {
+    internal suspend fun readReplies(chatId: String, after: Long?, requireRoles: Boolean = false): ReplySnapshot {
         require(chatId.isNotBlank() && chatId.length <= 160)
         val replies = mutableListOf<ObservedReply>()
         var timestamp: Long? = null
         var finished = true
+        var roleName = ""
         var text = StringBuilder()
         var snapshot: ReplySnapshot? = null
         var chars = 0
@@ -92,6 +93,8 @@ class OperitBridge(context: Context) : AutoCloseable {
                         check(after != null && it > after && it > (replies.lastOrNull()?.timestamp ?: -1))
                     }
                     finished = event["finished"]?.asBoolean ?: error("OPERIT_INVALID_EVENT")
+                    roleName = event["roleName"]?.asString.orEmpty().trim()
+                    check(roleName.length <= 256) { "OPERIT_INVALID_EVENT" }
                     text = StringBuilder()
                 }
                 "chunk" -> {
@@ -101,7 +104,7 @@ class OperitBridge(context: Context) : AutoCloseable {
                     text.append(delta)
                 }
                 "message_end" -> {
-                    replies += ObservedReply(requireNotNull(timestamp), text.toString(), finished)
+                    replies += ObservedReply(requireNotNull(timestamp), text.toString(), finished, roleName)
                     timestamp = null
                 }
                 "snapshot" -> {
@@ -112,7 +115,11 @@ class OperitBridge(context: Context) : AutoCloseable {
                     check(replies.filter { it.finished }.all { it.timestamp <= cursor })
                     val notice = event["notice"]?.asString
                     check(notice == null || notice in setOf("HISTORY_GAP", "MESSAGE_TOO_LARGE")) { "OPERIT_INVALID_EVENT" }
-                    snapshot = ReplySnapshot(cursor, replies.toList(), event["processing"].asBoolean, event["failed"].asBoolean, notice)
+                    val roleMetadata = event["roleMetadata"]?.asBoolean == true
+                    if (requireRoles) check(roleMetadata) { "OPERIT_PLUGIN_UPDATE_REQUIRED" }
+                    val roles = event["roles"]?.asJsonArray?.map { it.asString } ?: emptyList()
+                    check(roles.size <= 64 && roles.all { it.isNotBlank() && it.length <= 256 }) { "OPERIT_INVALID_EVENT" }
+                    snapshot = ReplySnapshot(cursor, replies.toList(), event["processing"].asBoolean, event["failed"].asBoolean, notice, roles, roleMetadata)
                 }
                 else -> error("OPERIT_INVALID_EVENT")
             }
