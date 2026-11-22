@@ -24,5 +24,10 @@
             android:foregroundServiceType="microphone|mediaPlayback" />
         <provider android:name=".OperitProvider" android:authorities="com.huigu.phone10.mobile.operit"
             android:exported="false" android:grantUriPermissions="true" />
+        <provider android:name=".IncomingProvider" android:authorities="com.huigu.phone10.mobile.incoming"
+            android:exported="true" />
+        <activity android:name=".IncomingAcceptActivity" android:exported="false"
+            android:excludeFromRecents="true" android:theme="@android:style/Theme.Material.Light.NoActionBar" />
+        <receiver android:name=".IncomingDeclineReceiver" android:exported="false" />
     </application>
 </manifest>

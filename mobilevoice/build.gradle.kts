@@ -13,8 +13,8 @@ android {
         applicationId = "com.huigu.phone10.mobile"
         minSdk = 26
         targetSdk = 36
-        versionCode = 68
-        versionName = "0.3.37-preview"
+        versionCode = 85
+        versionName = "0.3.50-eleven-fix1"
     }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_1_8

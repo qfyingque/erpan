@@ -28,7 +28,11 @@ internal suspend fun consumeOperitEvents(pending: OperitPending, timeout: Long, 
                 currentCoroutineContext().ensureActive()
                 when (event["type"].asString) {
                     "error" -> error(event["code"]?.asString ?: "OPERIT_UNAVAILABLE")
-                    "complete" -> return@withTimeout
+                    "complete" -> {
+                        if (pending.kind == "cancel" && event["released"]?.asBoolean != true)
+                            error("OPERIT_PLUGIN_UPDATE_REQUIRED")
+                        return@withTimeout
+                    }
                     else -> consume(event)
                 }
             }
@@ -44,6 +48,7 @@ internal suspend fun consumeOperitEvents(pending: OperitPending, timeout: Long, 
 class OperitBridge(context: Context) : AutoCloseable {
     private val context = context.applicationContext
     private val active = ConcurrentHashMap<OperitPending, Job>()
+    private val cancellation = OperitCancellationGate { id, checkOnly -> cancelRemote(id, checkOnly) }
     @Volatile private var closed = false
 
     suspend fun listChats(): List<OperitChat> {
@@ -68,6 +73,9 @@ class OperitBridge(context: Context) : AutoCloseable {
         require(chatId.isNotBlank() && chatId.length <= 160 && text.isNotBlank() && text.length <= 60_000) {
             "OPERIT_INVALID_REQUEST"
         }
+        check(!closed) { "OPERIT_CLOSED" }
+        // This is a read-only query of the previous request, never a message retry.
+        cancellation.awaitReady(chatId)
         // Match the supported O plugin window, plus its existing 10s IPC margin.
         // List/observe operations keep their short timeouts; manual stop is immediate.
         execute(OperitPending("reply", chatId, text), 30 * 60_000L + 10_000L) { event ->
@@ -141,14 +149,19 @@ class OperitBridge(context: Context) : AutoCloseable {
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (error: Exception) {
-            throw IllegalStateException(safeCode(pending.failure ?: error.message))
+            throw OperitBridgeFailure(safeCode(pending.failure ?: error.message))
         } finally {
             pending.cancel()
-            // Interruptions wait at most 1.5 seconds for a nonce-specific cancel.
-            // No message is retried, including timeout and unknown result cases.
+            // Audio stops immediately. Upstream cleanup waits for the original
+            // worker's release; timeout keeps a per-chat barrier for the next send.
             withContext(NonCancellable + Dispatchers.IO) {
                 try {
-                    if (!completed && pending.kind == "reply") cancelRemote(pending)
+                    if (!completed && pending.kind == "reply") {
+                        try { cancellation.cancelAndAwait(requireNotNull(pending.chatId), pending.id) }
+                        catch (error: Exception) {
+                            VoiceDiagnostics.record("operit_cancel_unsettled_${safeCode(error.message)}")
+                        }
+                    }
                 } finally {
                     revoke(pending)
                     active.remove(pending)
@@ -157,19 +170,17 @@ class OperitBridge(context: Context) : AutoCloseable {
         }
     }
 
-    private suspend fun cancelRemote(target: OperitPending) {
-        val cancel = OperitPending("cancel", targetId = target.id)
+    private suspend fun cancelRemote(targetId: String, checkOnly: Boolean) {
+        val cancel = OperitPending("cancel", targetId = targetId, waitForRelease = true, checkOnly = checkOnly)
         try {
             OperitInbox.add(cancel)
             dispatch(cancel)
-            withTimeoutOrNull(1500) {
-                for (event in cancel.events) {
-                    if (event["type"].asString in listOf("complete", "error")) break
-                }
-            }
-        } catch (_: Exception) {
-            // Best effort upstream cancel; native cancellation already rejects
-            // every old chunk. Operit keeps its active token until its send finishes.
+            consumeOperitEvents(cancel, 6000) { }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (error: Exception) {
+            val code = safeCode(cancel.failure ?: error.message)
+            throw OperitBridgeFailure(if (code == "OPERIT_TIMEOUT") "OPERIT_CANCEL_PENDING" else code)
         } finally { cancel.cancel(); revoke(cancel) }
     }
 
@@ -209,7 +220,7 @@ class OperitBridge(context: Context) : AutoCloseable {
         private val codes = setOf("OPERIT_INVALID_REQUEST", "OPERIT_CLOSED", "OPERIT_INVALID_EVENT", "OPERIT_INCOMPLETE",
             "OPERIT_EVENT_OVERFLOW", "OPERIT_UNAVAILABLE", "OPERIT_TIMEOUT", "OPERIT_STREAMING_UNAVAILABLE", "REQUEST_ALREADY_CLAIMED",
             "OPERIT_BUSY", "JOURNAL_FAILED", "JOURNAL_FULL", "INVALID_OPERIT_RESPONSE", "RESPONSE_TOO_LARGE",
-            "OPERIT_REPLY_FAILED", "OPERIT_LIST_FAILED", "OPERIT_CANCEL_FAILED", "INVALID_REQUEST",
+            "OPERIT_REPLY_FAILED", "OPERIT_LIST_FAILED", "OPERIT_CANCEL_FAILED", "OPERIT_CANCEL_PENDING", "INVALID_REQUEST",
             "OPERIT_WORKER_FAILED", "OPERIT_WORKER_UNAVAILABLE", "OPERIT_OBSERVE_UNAVAILABLE", "OPERIT_OBSERVE_FAILED", "OPERIT_PLUGIN_UPDATE_REQUIRED")
         internal fun safeCode(value: String?) = value?.takeIf { it in codes } ?: "OPERIT_UNAVAILABLE"
     }

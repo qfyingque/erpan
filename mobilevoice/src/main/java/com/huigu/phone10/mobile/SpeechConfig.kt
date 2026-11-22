@@ -10,16 +10,29 @@ data class SpeechConfig(val sttBaseUrl: String, val sttKey: String, val sttModel
     val volcResource: String? = null, val volcAppId: String? = null, val voicePrompt: String? = null,
     val sttVolcResource: String? = null, val sttVolcAppId: String? = null,
     val mossSpeed: Double? = null, val qwenSplitGranularity: String? = null,
-    val mossTextMode: String? = null) {
+    val mossTextMode: String? = null,
+    val miniMaxVoiceSettings: MiniMaxVoiceSettings? = null,
+    val elevenVoiceSettings: ElevenVoiceSettings? = null,
+    val miniMaxTransport: String? = null, val miniMaxHttpUrl: String? = null) {
     // Gson leaves fields absent from older encrypted settings null.
     val isBailian: Boolean get() = provider == BAILIAN
     val effectiveTtsProvider: String get() = ttsProvider ?: provider ?: OPENAI
+    val tokenPlanStt: Boolean get() = isBailian && TokenPlanSpeech.matches(sttBaseUrl)
+    val tokenPlanTts: Boolean get() = effectiveTtsProvider == BAILIAN && TokenPlanSpeech.matches(ttsBaseUrl)
+    val nativeEmotionRecognition: Boolean get() = provider == QWEN_ASR || provider == VOLCENGINE ||
+        (isBailian && !tokenPlanStt && sttModel == "paraformer-realtime-8k-v2")
+    val timingRecognition: Boolean get() = (isBailian && !tokenPlanStt) || provider == VOLCENGINE
     val elevenDialogueTts: Boolean get() = effectiveTtsProvider == ELEVENLABS && ttsModel == "eleven_v4_turbo"
     val elevenHttpTts: Boolean get() = effectiveTtsProvider == ELEVENLABS && ttsModel in setOf("eleven_v3", "eleven_v4")
-    val streamingTts: Boolean get() = effectiveTtsProvider in setOf(BAILIAN, MINIMAX, VOLCENGINE, QWEN_LOCAL) ||
+    val effectiveMiniMaxTransport: String get() = miniMaxTransport ?: "bidi"
+    val miniMaxHttpTts: Boolean get() = effectiveTtsProvider == MINIMAX && effectiveMiniMaxTransport in setOf("http_whole", "http_sentence", "http_300")
+    val miniMaxChunkMode: String get() = if (miniMaxHttpTts && effectiveMiniMaxTransport != "http_whole") effectiveMiniMaxTransport else ""
+    val effectiveMiniMaxHttpUrl: String get() = miniMaxHttpUrl?.takeIf { it.isNotBlank() }
+        ?: MiniMaxHttpSpeech.officialHttpUrl(ttsBaseUrl)
+    val streamingTts: Boolean get() = (!tokenPlanTts && !miniMaxHttpTts && effectiveTtsProvider in setOf(BAILIAN, MINIMAX, VOLCENGINE, QWEN_LOCAL)) ||
         (effectiveTtsProvider == ELEVENLABS && ttsModel == "eleven_flash_v2_5") || elevenDialogueTts
-    val sentenceHttpTts: Boolean get() = effectiveTtsProvider == MOSSLAND ||
-        elevenHttpTts
+    val sentenceHttpTts: Boolean get() = effectiveTtsProvider in setOf(MOSSLAND, FISH_AUDIO) ||
+        elevenHttpTts || tokenPlanTts || miniMaxHttpTts
     val effectiveVolcResource: String get() = volcResource ?: "seed-icl-2.0"
     val effectiveSttVolcResource: String get() = sttVolcResource ?: "volc.seedasr.sauc.duration"
     val effectiveMossSpeed: Double get() = mossSpeed ?: 1.0
@@ -27,7 +40,7 @@ data class SpeechConfig(val sttBaseUrl: String, val sttKey: String, val sttModel
     val coherentTts: Boolean get() = effectiveTtsProvider == MOSSLAND && effectiveMossTextMode == "coherent"
     val effectiveQwenSplitGranularity: String get() = qwenSplitGranularity ?: "sentence"
     val wholeReplyTts: Boolean get() = (effectiveTtsProvider == QWEN_LOCAL && effectiveQwenSplitGranularity == "none") ||
-        (effectiveTtsProvider == MOSSLAND && effectiveMossTextMode == "whole")
+        (effectiveTtsProvider == MOSSLAND && effectiveMossTextMode == "whole") || (miniMaxHttpTts && effectiveMiniMaxTransport == "http_whole")
     val clientSegmentedTts: Boolean get() = effectiveTtsProvider == QWEN_LOCAL && effectiveQwenSplitGranularity == "client_segments"
     val supportsVoicePrompt: Boolean get() = effectiveVolcResource == "seed-tts-2.0" ||
         (effectiveVolcResource == "seed-icl-2.0" && ttsModel == "seed-tts-2.0-expressive")
@@ -41,6 +54,8 @@ data class SpeechConfig(val sttBaseUrl: String, val sttKey: String, val sttModel
                 ttsKey = "", ttsModel = "speech-2.8-turbo", voice = "male-qn-qingse")
             MOSSLAND -> copy(ttsBaseUrl = "https://api.mosi.cn/v1",
                 ttsKey = "", ttsModel = "moss-tts-1.5-flash", voice = "")
+            FISH_AUDIO -> copy(ttsBaseUrl = FishSpeech.BASE,
+                ttsKey = "", ttsModel = FishSpeech.DEFAULT_MODEL, voice = "")
             VOLCENGINE -> copy(ttsBaseUrl = "wss://openspeech.bytedance.com/api/v3/tts/bidirection",
                 ttsKey = "", ttsModel = "seed-tts-2.0-expressive", voice = "")
             QWEN_LOCAL -> copy(ttsBaseUrl = "", ttsKey = "", ttsModel = "qwen-a-clone", voice = "xiaoying-a")
@@ -49,7 +64,8 @@ data class SpeechConfig(val sttBaseUrl: String, val sttKey: String, val sttModel
             else -> throw IllegalArgumentException("请选择支持的合成服务。")
         }
         return copy(ttsProvider = next, ttsBaseUrl = defaults.ttsBaseUrl, ttsKey = defaults.ttsKey,
-            ttsModel = defaults.ttsModel, voice = defaults.voice, qwenSplitGranularity = null, mossTextMode = null)
+            ttsModel = defaults.ttsModel, voice = defaults.voice, qwenSplitGranularity = null, mossTextMode = null,
+            miniMaxVoiceSettings = null, elevenVoiceSettings = null, miniMaxTransport = null, miniMaxHttpUrl = null)
     }
 
     fun withSttProvider(next: String, restored: SpeechConfig? = null): SpeechConfig {
@@ -57,6 +73,7 @@ data class SpeechConfig(val sttBaseUrl: String, val sttKey: String, val sttModel
         val defaults = restored ?: when (next) {
             BAILIAN -> bailianDefaults()
             OPENAI -> openAiDefaults()
+            QWEN_ASR -> copy(sttBaseUrl = QwenAsrSpeech.BASE, sttKey = "", sttModel = QwenAsrSpeech.MODEL)
             MINIMAX -> copy(sttBaseUrl = "https://api.minimaxi.com/v1", sttKey = "", sttModel = "asr-1.0")
             MOSSLAND -> copy(sttBaseUrl = "https://api.mosi.cn/v1", sttKey = "", sttModel = "moss-transcribe-1.0")
             else -> copy(sttBaseUrl = "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_async",
@@ -74,6 +91,7 @@ data class SpeechConfig(val sttBaseUrl: String, val sttKey: String, val sttModel
     }
 
     fun validationErrors(includeRecognition: Boolean = true): List<String> = buildList {
+        addAll(voiceTuningErrors())
         if (includeRecognition && provider != null && provider !in STT_PROVIDERS) add("识别服务商：请选择支持的服务。")
         fun address(label: String, value: String, validate: () -> Unit) {
             if (value.isBlank()) add("$label：请填写地址。")
@@ -83,18 +101,22 @@ data class SpeechConfig(val sttBaseUrl: String, val sttKey: String, val sttModel
         }
         if (includeRecognition) address("识别接口地址", sttBaseUrl) {
             when (provider) {
-                BAILIAN -> bailianEndpoint(sttBaseUrl)
+                BAILIAN -> if (tokenPlanStt) TokenPlanSpeech.endpoint(sttBaseUrl, true) else bailianEndpoint(sttBaseUrl)
+                QWEN_ASR -> QwenAsrSpeech.endpoint(sttBaseUrl)
                 VOLCENGINE -> volcengineRecognitionEndpoint(sttBaseUrl)
                 else -> base(sttBaseUrl)
             }
         }
-        address("合成接口地址", ttsBaseUrl) {
+        if (effectiveTtsProvider == MINIMAX && effectiveMiniMaxTransport !in setOf("bidi", "http_whole", "http_sentence", "http_300"))
+            add("MiniMax 接法：请在菜单中选择支持的提交方式。")
+        address("合成接口地址", if (miniMaxHttpTts) effectiveMiniMaxHttpUrl else ttsBaseUrl) {
             when (effectiveTtsProvider) {
-                BAILIAN -> bailianEndpoint(ttsBaseUrl)
-                MINIMAX -> minimaxEndpoint(ttsBaseUrl)
+                BAILIAN -> if (tokenPlanTts) TokenPlanSpeech.endpoint(ttsBaseUrl, false) else bailianEndpoint(ttsBaseUrl)
+                MINIMAX -> if (miniMaxHttpTts) MiniMaxHttpSpeech.endpoint(effectiveMiniMaxHttpUrl) else minimaxEndpoint(ttsBaseUrl)
                 VOLCENGINE -> volcengineEndpoint(ttsBaseUrl)
                 QWEN_LOCAL -> qwenEndpoint(ttsBaseUrl)
                 ELEVENLABS -> elevenEndpoint()
+                FISH_AUDIO -> FishSpeech.endpoint(ttsBaseUrl)
                 OPENAI, MOSSLAND -> base(ttsBaseUrl)
                 else -> throw IllegalArgumentException("请选择支持的合成服务。")
             }
@@ -106,6 +128,18 @@ data class SpeechConfig(val sttBaseUrl: String, val sttKey: String, val sttModel
                 (label.endsWith("Key") && value.any { it.code !in 33..126 }))
                 add("$label：格式不正确，请重新复制完整内容。")
         }
+        if (includeRecognition && tokenPlanStt && sttModel != TokenPlanSpeech.ASR_MODEL)
+            add("套餐识别模型：本入口使用 qwen-audio-3.0-asr-flash。")
+        if (includeRecognition && provider == QWEN_ASR) {
+            if (!QwenAsrSpeech.validModel(sttModel)) add("Qwen ASR 模型：请使用 qwen3-asr-flash 或对应日期版本。")
+            if (sttKey.startsWith("sk-sp-")) add("Qwen ASR 使用普通百炼 Key，不使用 Token Plan 套餐专属 Key。")
+        }
+        if (tokenPlanTts && ttsModel != TokenPlanSpeech.TTS_MODEL)
+            add("套餐合成模型：本入口使用 qwen-audio-3.0-tts-plus。")
+        if (includeRecognition && isBailian && !tokenPlanStt && sttKey.startsWith("sk-sp-"))
+            add("识别套餐密钥请使用「填入 Token Plan 套餐配置」及套餐专用地址。")
+        if (effectiveTtsProvider == BAILIAN && !tokenPlanTts && ttsKey.startsWith("sk-sp-"))
+            add("合成套餐密钥请使用「填入 Token Plan 套餐配置」及套餐专用地址。")
         if (effectiveTtsProvider == QWEN_LOCAL) {
             val namedId = Regex("[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
             if (!namedId.matches(ttsModel)) add("合成模型：请填写电脑语音服务提供的模型编号。")
@@ -117,6 +151,12 @@ data class SpeechConfig(val sttBaseUrl: String, val sttKey: String, val sttModel
             if (ttsModel !in setOf("eleven_flash_v2_5", "eleven_v3", "eleven_v4", "eleven_v4_turbo"))
                 add("ElevenLabs 模型：请选择 Flash v2.5、v3、v4 或 v4 Turbo。")
             if (!Regex("[A-Za-z0-9_-]{1,128}").matches(voice)) add("ElevenLabs 音色：请填写平台提供的 Voice ID，不是名称或网址。")
+        }
+        if (effectiveTtsProvider == FISH_AUDIO) {
+            if (ttsModel !in FishSpeech.models)
+                add("Fish Audio 模型：请从列表选择，避免错误模型名被服务回落到收费默认模型。")
+            if (!Regex("[A-Za-z0-9_-]{1,128}").matches(voice))
+                add("Fish Audio 音色：请填写声音编号 reference_id，不是声音名称或网址。")
         }
         if (effectiveTtsProvider == MOSSLAND && effectiveMossTextMode !in setOf("fast", "coherent", "whole"))
             add("Moss 朗读方式：请选择支持的模式。")
@@ -170,6 +210,9 @@ data class SpeechConfig(val sttBaseUrl: String, val sttKey: String, val sttModel
                 }
             }.build()
     }
+
+    internal fun elevenVoiceSettingsEndpoint(): HttpUrl = elevenEndpoint().newBuilder()
+        .query(null).encodedPath("/v1/voices").addPathSegment(voice).addPathSegment("settings").build()
 
     internal fun qwenEndpoint(value: String): String {
         val uri = try { URI(value.trim()) } catch (_: Exception) { null }
@@ -238,12 +281,14 @@ data class SpeechConfig(val sttBaseUrl: String, val sttKey: String, val sttModel
     companion object {
         const val OPENAI = "openai"
         const val BAILIAN = "bailian"
+        const val QWEN_ASR = "qwen-asr"
         const val MINIMAX = "minimax"
         const val MOSSLAND = "mossland"
+        const val FISH_AUDIO = "fish-audio"
         const val VOLCENGINE = "volcengine"
         const val QWEN_LOCAL = "qwen-local"
         const val ELEVENLABS = "elevenlabs"
-        val STT_PROVIDERS = setOf(BAILIAN, OPENAI, VOLCENGINE, MINIMAX, MOSSLAND)
+        val STT_PROVIDERS = setOf(BAILIAN, QWEN_ASR, OPENAI, VOLCENGINE, MINIMAX, MOSSLAND)
         val MOSS_STT_MODELS = setOf("moss-transcribe-1.0", "moss-transcribe-diarize-pro")
         val VOLC_STT_RESOURCES = setOf("volc.seedasr.sauc.duration", "volc.seedasr.sauc.concurrent",
             "volc.bigasr.sauc.duration", "volc.bigasr.sauc.concurrent")

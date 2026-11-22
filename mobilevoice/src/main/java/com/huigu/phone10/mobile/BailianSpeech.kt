@@ -28,7 +28,8 @@ internal class BailianSpeech(
 
     suspend fun transcribeDetailed(pcm: ByteArray): SpeechTranscript {
         require(pcm.isNotEmpty() && pcm.size % 2 == 0 && pcm.size <= 960_000) { "录音数据无效。" }
-        return exchange(pcm, null, {})
+        val input = BailianRecognitionAudio.prepare(config.sttModel, pcm)
+        return exchange(input.pcm, null, {})
     }
 
     suspend fun speak(text: String, onPcm: (ByteArray) -> Unit) {
@@ -127,7 +128,9 @@ internal class BailianSpeech(
                         addProperty("function", if (asr) "recognition" else "SpeechSynthesizer")
                         addProperty("model", if (asr) config.sttModel else config.ttsModel)
                         add("parameters", JsonObject().apply {
-                            addProperty("format", "pcm"); addProperty("sample_rate", if (asr) 16_000 else 24_000)
+                            addProperty("format", "pcm")
+                            addProperty("sample_rate", if (!asr) 24_000 else if (config.sttModel == "paraformer-realtime-8k-v2") 8000 else 16000)
+                            if (asr && config.sttModel == "paraformer-realtime-8k-v2") addProperty("semantic_punctuation_enabled", false)
                             if (!asr) { addProperty("text_type", "PlainText"); addProperty("voice", config.voice) }
                         })
                     })

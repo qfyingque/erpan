@@ -22,10 +22,12 @@ import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 
@@ -34,6 +36,7 @@ import androidx.compose.ui.viewinterop.AndroidView
     busy: Boolean, notice: String, onStart: () -> Unit, onEnd: () -> Unit,
     onOverlay: (Boolean) -> Unit, onSmart: (Boolean) -> Unit, onConfirmBeforeSend: (Boolean) -> Unit,
     onVoiceInterruption: (Boolean) -> Unit, onReviewDraft: () -> Unit,
+    onEmotionHints: (Boolean) -> Unit, onTimingHints: (Boolean) -> Unit,
     onAvatar: () -> Unit,
     onConfig: () -> Unit, onLogs: () -> Unit, onAbout: () -> Unit,
     onProfiles: () -> Unit, onCaptions: (Boolean) -> Unit, onCaptionAppearance: () -> Unit, onKeepsakes: () -> Unit,
@@ -169,6 +172,28 @@ import androidx.compose.ui.viewinterop.AndroidView
                         enabled = !settings.listenOnly && !busy,
                         helper = "说话时停止 AI 朗读", onChange = onVoiceInterruption)
                     CallSettingDivider()
+                        val detailedRecognition = settings.speech.timingRecognition
+                        val supplementalEmotion = settings.emotionSource?.let { it.enabled && it.validationErrors().isEmpty() } == true
+                    val hintsEnabled = !settings.listenOnly && !state.running && !busy
+                    CompactCallToggle("传递情绪线索", settings.sendEmotionHints,
+                        enabled = hintsEnabled,
+                        helper = when {
+                            settings.listenOnly -> "语音通话时可用"
+                            state.running -> "结束通话后可调整"
+                                settings.speech.nativeEmotionRecognition -> if (supplementalEmotion) "原生情绪优先；缺失时额外分析" else "传递原生情绪；没有则只发文字"
+                                supplementalEmotion -> "额外音频分析 · 按百炼 API 计费"
+                                else -> "当前模型无情绪，请在连接配置补充"
+                        }, onChange = onEmotionHints)
+                    CallSettingDivider()
+                    CompactCallToggle("传递停顿信息", settings.sendTimingHints,
+                        enabled = hintsEnabled,
+                        helper = when {
+                            settings.listenOnly -> "语音通话时可用"
+                            state.running -> "结束通话后可调整"
+                            detailedRecognition -> "附加服务返回的时间与间隔；不改变断句"
+                            else -> "当前识别接法仅返回文字，此开关暂不生效"
+                        }, onChange = onTimingHints)
+                    CallSettingDivider()
                     CompactCallToggle("悬浮字幕", if (state.running) state.captionsVisible else settings.captionsEnabled,
                         enabled = !busy, helper = "字幕设置", onChange = onCaptions,
                         onSettings = onCaptionAppearance)
@@ -233,13 +258,11 @@ import androidx.compose.ui.viewinterop.AndroidView
 
 @Composable private fun CompactCallToggle(title: String, checked: Boolean, enabled: Boolean,
     helper: String, onChange: (Boolean) -> Unit, onSettings: (() -> Unit)? = null) {
-    Row(Modifier.fillMaxWidth().heightIn(min = 80.dp).padding(horizontal = 2.dp, vertical = 4.dp),
+    Row(Modifier.fillMaxWidth().heightIn(min = 56.dp).padding(horizontal = 2.dp, vertical = 4.dp),
         verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-        Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(if (onSettings == null) 3.dp else 0.dp)) {
+        Column(Modifier.weight(1f)) {
             Text(title, fontSize = 17.sp, color = ErpanColors.CoalText)
-            if (onSettings == null) {
-                Text(helper, color = ErpanColors.CoalMuted, fontSize = 12.sp, lineHeight = 17.sp)
-            } else {
+            if (onSettings != null) {
                 Row(Modifier.fillMaxWidth().heightIn(min = 48.dp)
                     .clickable(role = Role.Button, onClick = onSettings),
                     verticalAlignment = Alignment.CenterVertically) {
@@ -249,16 +272,27 @@ import androidx.compose.ui.viewinterop.AndroidView
                 }
             }
         }
-        Switch(checked = checked, onCheckedChange = onChange, enabled = enabled,
-            modifier = Modifier.semantics { contentDescription = title },
-            thumbContent = { Box(Modifier.size(16.dp)) },
-            colors = SwitchDefaults.colors(
-                checkedThumbColor = Color(0xFFF4F2F1), uncheckedThumbColor = Color(0xFFF4F2F1),
-                checkedTrackColor = Color(0xFF646266), uncheckedTrackColor = Color(0xFF49484C),
-                checkedBorderColor = Color(0xFFCAC7CA), uncheckedBorderColor = Color(0xFFCAC7CA),
-                disabledCheckedThumbColor = Color(0xFFAAA8AB), disabledUncheckedThumbColor = Color(0xFFAAA8AB),
-                disabledCheckedTrackColor = Color(0xFF454448), disabledUncheckedTrackColor = Color(0xFF454448),
-                disabledCheckedBorderColor = Color(0xFF777579), disabledUncheckedBorderColor = Color(0xFF777579)))
+        // Keep the physical direction consistent: right is on, including RTL system locales.
+        CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Ltr) {
+            Switch(checked = checked, onCheckedChange = onChange, enabled = enabled,
+                modifier = Modifier.semantics {
+                    // Preserve useful explanations for screen readers without crowding the card.
+                    contentDescription = if (onSettings == null) "$title，$helper" else title
+                },
+                colors = SwitchDefaults.colors(
+                    checkedThumbColor = ErpanColors.CoalText,
+                    checkedTrackColor = ErpanColors.Rose,
+                    checkedBorderColor = Color.Transparent,
+                    uncheckedThumbColor = ErpanColors.SwitchOffThumb,
+                    uncheckedTrackColor = ErpanColors.SwitchOffTrack,
+                    uncheckedBorderColor = ErpanColors.SwitchOffBorder,
+                    disabledCheckedThumbColor = ErpanColors.CoalText.copy(alpha = 0.85f),
+                    disabledCheckedTrackColor = ErpanColors.Rose.copy(alpha = 0.65f),
+                    disabledCheckedBorderColor = Color.Transparent,
+                    disabledUncheckedThumbColor = ErpanColors.SwitchOffThumb.copy(alpha = 0.65f),
+                    disabledUncheckedTrackColor = ErpanColors.SwitchOffTrack,
+                    disabledUncheckedBorderColor = ErpanColors.SwitchOffBorder.copy(alpha = 0.6f)))
+        }
     }
 }
 

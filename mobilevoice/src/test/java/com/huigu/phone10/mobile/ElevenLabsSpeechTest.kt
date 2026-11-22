@@ -130,6 +130,23 @@ class ElevenLabsSpeechTest {
         }
     }
 
+    @Test fun flashContinuesAfterNullFinalFlagAndPlaysThroughLastFrame() = runBlocking {
+        Fixture { ws, text ->
+            if (text.isEmpty()) {
+                ws.send("""{"audio":"AQI=","isFinal":null}""")
+                ws.send("""{"audio":"AwQ=","isFinal":false}""")
+                ws.send("""{"audio":"BQY=","isFinal":true}""")
+            }
+        }.use { f ->
+            val input = Channel<String>(1).apply { trySend("读到最后。"); close() }
+            val pcm = mutableListOf<Byte>()
+            withTimeout(5000) {
+                CloudSpeech(config(), f.client, f.factory).speakStream(input) { pcm.addAll(it.toList()) }
+            }
+            assertEquals(listOf<Byte>(1, 2, 3, 4, 5, 6), pcm)
+        }
+    }
+
     @Test fun flashRejectsTruncatedPcmAndProviderErrorsWithoutExposingBody() = runBlocking {
         for (payload in listOf("""{"audio":"AQ==","isFinal":true}""", """{"error":"SECRET server failure"}""")) {
             Fixture { ws, text -> if (text.isEmpty()) ws.send(payload) }.use { f ->

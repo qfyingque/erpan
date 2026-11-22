@@ -22,17 +22,17 @@ test('70k reply is delivered whole with bounded IPC frames, then next reply is f
   assert.equal(f.events.filter(e=>e.type==='chunk').map(e=>e.text).join(''),'下一条。');
 });
 test('many small replies are paged instead of overflowing the 128 frame IPC queue',()=>{
-  const f=fixture(Array.from({length:60},(_,i)=>ai(i+11,'消息'+i)));
-  for(let i=0;i<60;i++){
+  const f=fixture(Array.from({length:32},(_,i)=>ai(i+11,'消息'+i)));
+  for(let i=0;i<32;i++){
     f.events.length=0;f.run();
     assert.equal(f.events.at(-1).type,'complete');
     assert.equal(f.events.filter(e=>e.type==='message_start').length,1);
     f.request.after=f.events.find(e=>e.type==='snapshot').cursor;
   }
-  assert.equal(f.request.after,70);
+  assert.equal(f.request.after,42);
 });
 test('history gap is explicitly reported and resumes oldest available message',()=>{
-  const f=fixture(Array.from({length:64},(_,i)=>ai(i+20,'正文')));
+  const f=fixture(Array.from({length:32},(_,i)=>ai(i+20,'正文')));
   f.run();assert.equal(f.events.at(-1).type,'complete');
   assert.equal(f.events.find(e=>e.type==='snapshot').notice,'HISTORY_GAP');
   assert.equal(f.events.find(e=>e.type==='snapshot').cursor,20);

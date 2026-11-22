@@ -4,6 +4,7 @@ class SpeechText(private val preserveSpacing: Boolean = false,
                  private val sentenceMode: Boolean = false,
                  private val firstClauseMode: Boolean = false,
                  private val coherentMode: Boolean = false,
+                 private val miniMaxChunkMode: String = "",
                  private val nowMillis: () -> Long = { System.nanoTime() / 1_000_000 }) {
     private val pending = StringBuilder()
     private var tag: StringBuilder? = null
@@ -11,6 +12,10 @@ class SpeechText(private val preserveSpacing: Boolean = false,
     private var firstAt: Long? = null
     private var emitted = false
     private var quote: Char? = null
+    private val miniMaxSentence get() = miniMaxChunkMode == "http_sentence"
+    private val miniMaxChunks get() = miniMaxSentence || miniMaxChunkMode == "http_300"
+    private val sentenceStops = "。！？.!?"
+    private val sentenceClosers = "”’\"')）】」』"
 
     fun push(delta: String): List<String> {
         val result = mutableListOf<String>()
@@ -39,6 +44,15 @@ class SpeechText(private val preserveSpacing: Boolean = false,
     fun flush(): List<String> = emit().let { if (it.isEmpty()) emptyList() else listOf(it) }
 
     fun flushReady(): List<String> {
+        if (miniMaxChunks) {
+            // The 300-character comparison deliberately never uses the legacy timer.
+            if (!miniMaxSentence) return emptyList()
+            val end = pending.indexOfLast { it !in sentenceClosers && !it.isWhitespace() }
+            // A trailing decimal point may still be followed by a streamed digit.
+            if (end >= 0 && pending[end] in "。！？!?" ||
+                firstAt?.let { nowMillis() - it >= 2500 } == true) return flush()
+            return emptyList()
+        }
         val deadline = if (coherentMode) { if (emitted) 5000 else 2500 } else if (firstClauseMode || sentenceMode) 1500 else if (emitted) 400 else 150
         if (firstAt?.let { nowMillis() - it >= deadline } != true) return emptyList()
         // A timer or tool pause does not mean the incoming word is complete.
@@ -52,11 +66,27 @@ class SpeechText(private val preserveSpacing: Boolean = false,
 
     private fun lastClauseEnd(): Int = pending.indexOfLast { it in "，。！？；：,.!?;:\n" } + 1
 
-    private fun visible(char: Char, output: MutableList<String>) {
+    private fun visible(inputChar: Char, output: MutableList<String>) {
         if (hidden.isNotEmpty()) return
+        // Normalize before the MiniMax counter, matching emit()'s spoken text.
+        // Discard repeated formatting as it arrives so raw markup cannot grow the buffer.
+        if (miniMaxChunks && inputChar in "`*_#") return
+        val char = if (miniMaxChunks && inputChar.isWhitespace()) ' ' else inputChar
+        if (miniMaxChunks && char == ' ' && pending.lastOrNull() == ' ') return
+        // A timer may have submitted the sentence before its closing quote arrives.
+        // Do not synthesize a quote-only request or prefix it to the next sentence.
+        if (miniMaxSentence && emitted && pending.isBlank() && char in sentenceClosers) return
+        if (miniMaxSentence && pending.isNotEmpty() && char !in sentenceClosers && char !in sentenceStops) {
+            val end = pending.indexOfLast { it !in sentenceClosers && !it.isWhitespace() }
+            val decimal = end >= 0 && pending[end] == '.' && (end == 0 || pending[end - 1].isDigit()) && char.isDigit()
+            if (end >= 0 && pending[end] in sentenceStops && !decimal)
+                emit().takeIf { it.isNotEmpty() }?.let(output::add)
+        }
         if (firstAt == null && !char.isWhitespace()) firstAt = nowMillis()
         pending.append(char)
-        val boundary = if (coherentMode) {
+        val boundary = if (miniMaxChunks) {
+            pending.codePointCount(0, pending.length) >= 300 && !char.isHighSurrogate()
+        } else if (coherentMode) {
             val points = pending.codePointCount(0, pending.length)
             // First complete sentence, then longer contextual groups. Keep the punctuation.
             (char == '\n' && points >= 24) ||
@@ -83,7 +113,7 @@ class SpeechText(private val preserveSpacing: Boolean = false,
 
     private fun emit(end: Int = pending.length): String {
         // A streamed delta may stop between an emoji's UTF-16 code units.
-        val count = if ((firstClauseMode || coherentMode) && end > 0 && pending[end - 1].isHighSurrogate())
+        val count = if ((firstClauseMode || coherentMode || miniMaxChunks) && end > 0 && pending[end - 1].isHighSurrogate())
             end - 1 else end
         val cleaned = pending.substring(0, count).replace(Regex("[`*_#]"), "")
             .replace(Regex("\\s+"), " ")
@@ -97,7 +127,8 @@ class SpeechText(private val preserveSpacing: Boolean = false,
     private fun finishTag(raw: String) {
         val match = Regex("^<\\s*(/?)\\s*([A-Za-z][A-Za-z0-9_:-]*)").find(raw) ?: return
         val name = match.groupValues[2].lowercase()
-        val isHidden = name in setOf("think", "thinking", "analysis", "reasoning", "tool", "tools", "function", "status") ||
+        // Display-only translations use the same streaming-safe hiding as reasoning.
+        val isHidden = name in setOf("think", "thinking", "analysis", "reasoning", "tool", "tools", "function", "status", "translation") ||
             name.startsWith("tool_") || name.startsWith("function_")
         if (match.groupValues[1] == "/") {
             val index = hidden.lastIndexOf(name)

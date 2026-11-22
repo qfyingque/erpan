@@ -29,6 +29,9 @@ data class MobileSettings(
     val confirmBeforeSend: Boolean = false,
     val roleVoiceBindings: List<RoleVoiceBinding>? = null,
     val preserveBreath: Boolean = false,
+    val sendEmotionHints: Boolean = false,
+    val sendTimingHints: Boolean = false,
+    val emotionSource: EmotionSourceConfig? = null,
 )
 
 /** User-owned credentials stay encrypted in this app's non-backup storage. */

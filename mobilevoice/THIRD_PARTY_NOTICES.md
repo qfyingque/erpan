@@ -1,5 +1,7 @@
 # Third-party notices
 
+- Incoming-call notification design follows AndroidX CallStyle and Android platform-samples notification examples (Apache-2.0), https://github.com/android/platform-samples at 177c3b92c387894648d0a2d42d238e265b05bbc3. The invitation receipt and acceptance adapter reuse this project's original 2026-10-25 prototype; audio remains owned by VoiceService.
+
 - Android / AndroidX / Compose: Apache-2.0. Used through Android and Gradle APIs.
 - Kotlin and kotlinx.coroutines: Apache-2.0.
 - OkHttp 5.2.1: Apache-2.0; https://github.com/square/okhttp

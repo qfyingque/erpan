@@ -10,4 +10,5 @@ class ReplyVoice(
     val wholeReplyTts: Boolean,
     val firstClauseTts: Boolean,
     val coherentTts: Boolean,
+    val miniMaxChunkMode: String = "",
 )

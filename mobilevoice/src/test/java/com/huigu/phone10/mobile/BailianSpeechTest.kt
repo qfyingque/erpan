@@ -12,6 +12,26 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 
 class BailianSpeechTest {
+    @Test fun eightKhzEmotionModelUploadsActualEightKhzAudio() = runBlocking {
+        val wire = Wire()
+        val input = ByteArray(320) // Ten milliseconds at 16kHz PCM16 mono.
+        val job = async(Dispatchers.IO) {
+            BailianSpeech(config.copy(sttModel = "paraformer-realtime-8k-v2"), wire).transcribeDetailed(input)
+        }
+        val run = JsonParser.parseString(wire.next() as String).asJsonObject
+        val params = run["payload"].asJsonObject["parameters"].asJsonObject
+        assertEquals(8000, params["sample_rate"].asInt)
+        assertFalse(params["semantic_punctuation_enabled"].asBoolean)
+        val id = run["header"].asJsonObject["task_id"].asString
+        wire.event(id, "task-started")
+        assertEquals(160, (wire.next() as ByteString).size)
+        assertTrue((wire.next() as String).contains("finish-task"))
+        wire.event(id, "result-generated", """{"output":{"sentence":{"begin_time":0,"end_time":10,
+          "text":"好","sentence_end":true,"emo_tag":"positive","emo_confidence":0.9}}}""")
+        wire.event(id, "task-finished")
+        assertTrue(job.await().forChat(true, false).contains("正面"))
+    }
+
     @Test fun detailedRecognitionKeepsFinalMetadataWithoutAnotherRequest() = runBlocking {
         val wire = Wire()
         val job = async(Dispatchers.IO) { BailianSpeech(config, wire).transcribeDetailed(byteArrayOf(1, 2)) }
@@ -26,9 +46,9 @@ class BailianSpeechTest {
         wire.event(id, "task-finished")
         val result = job.await()
         assertEquals("你好", result.text)
-        assertTrue(result.forChat(includeVoiceHints = true).contains("疑似正面情感"))
-        assertFalse(result.forChat(includeVoiceHints = true).contains("负面"))
-        assertEquals(1, Regex("疑似正面情感").findAll(result.forChat(includeVoiceHints = true)).count())
+        assertTrue(result.forChat(includeEmotionHints = true, includeTimingHints = true).contains("疑似正面情感"))
+        assertFalse(result.forChat(includeEmotionHints = true, includeTimingHints = true).contains("负面"))
+        assertEquals(1, Regex("疑似正面情感").findAll(result.forChat(includeEmotionHints = true, includeTimingHints = true)).count())
         assertTrue(wire.sent.isEmpty())
     }
 

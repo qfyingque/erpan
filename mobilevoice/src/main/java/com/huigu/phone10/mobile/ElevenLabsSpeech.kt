@@ -60,8 +60,10 @@ internal class ElevenLabsSpeech(private val config: SpeechConfig, private val so
             }
             fun legacyText(text: String) = send(JsonObject().apply { addProperty("text", text) })
             fun control(name: String) = send(JsonObject().apply { addProperty(name, true) })
-            if (dialogue) send(JsonObject().apply { add("voices", JsonArray().apply { add(config.voice) }) })
-            else legacyText(" ")
+            send(JsonObject().apply {
+                if (dialogue) add("voices", JsonArray().apply { add(config.voice) }) else addProperty("text", " ")
+                config.elevenVoiceJson()?.let { add("voice_settings", it) }
+            })
             val inputFinished = AtomicBoolean(false)
             input = launch {
                 var characters = 0
@@ -120,7 +122,9 @@ internal class ElevenLabsSpeech(private val config: SpeechConfig, private val so
                 if (json.has("error") || json.has("message")) throw SpeechApiException("ElevenLabs 合成失败，请检查模型、音色、密钥与额度。")
                 val audio = json["audio"]?.takeUnless { it.isJsonNull }?.asString
                 if (!audio.isNullOrEmpty()) {
-                    val bytes = Base64.getDecoder().decode(audio)
+                    val bytes = try { Base64.getDecoder().decode(audio) } catch (_: IllegalArgumentException) {
+                        throw SpeechApiException("ElevenLabs 返回的音频编码无效。")
+                    }
                     total += bytes.size; require(total <= 86_400_000)
                     val aligned = carry?.let { byteArrayOf(it) + bytes } ?: bytes
                     val even = aligned.size and -2
@@ -128,8 +132,11 @@ internal class ElevenLabsSpeech(private val config: SpeechConfig, private val so
                     if (even > 0) runInterruptible { onPcm(aligned.copyOf(even)) }
                 }
                 // A dialogue turn marker is not session completion; queued text/audio still belongs here.
-                if (json[if (dialogue) "is_final" else "isFinal"]?.asBoolean == true) {
-                    require(inputFinished.get() && total > 0 && carry == null)
+                val finalFlag = json[if (dialogue) "is_final" else "isFinal"]
+                if (finalFlag?.takeUnless { it.isJsonNull }?.asBoolean == true) {
+                    if (!inputFinished.get()) throw SpeechApiException("ElevenLabs 在文字提交完成前结束了合成。")
+                    if (total == 0L) throw SpeechApiException("ElevenLabs 已结束合成，但未返回音频。")
+                    if (carry != null) throw SpeechApiException("ElevenLabs 结束时最后一个音频采样不完整。")
                     return@coroutineScope
                 }
             }

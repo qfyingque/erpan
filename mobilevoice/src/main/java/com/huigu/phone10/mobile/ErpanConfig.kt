@@ -29,7 +29,8 @@ import java.util.Locale
 @Composable internal fun ErpanConfig(settings: MobileSettings, enabled: Boolean, listing: Boolean, notice: String,
     target: String, onChange: (MobileSettings) -> Unit, onStt: (String) -> Unit, onTts: (String) -> Unit,
     onChats: () -> Unit, onSave: () -> Unit, onBack: () -> Unit, onAbout: () -> Unit,
-    checking: Boolean, onCheck: () -> Unit, profileName: String?, onSaveAs: () -> Unit) {
+    checking: Boolean, onCheck: () -> Unit, profileName: String?, onSaveAs: () -> Unit,
+    profileId: String?, onReadElevenSettings: (SpeechConfig, String?, ElevenVoiceSettings) -> Boolean) {
     var more by remember { mutableStateOf(false) }
     val voiceTarget = remember { BringIntoViewRequester() }
     val judgeTarget = remember { BringIntoViewRequester() }
@@ -59,9 +60,15 @@ import java.util.Locale
             if (!settings.listenOnly) {
             SectionTitle("语音识别")
             ProviderField("服务商", speech.provider ?: SpeechConfig.OPENAI, enabled,
-                listOf(SpeechConfig.BAILIAN to "阿里云百炼", SpeechConfig.VOLCENGINE to "火山引擎 / 豆包语音",
+                listOf(SpeechConfig.BAILIAN to "阿里云百炼", SpeechConfig.QWEN_ASR to "Qwen ASR · 含情绪", SpeechConfig.VOLCENGINE to "火山引擎 / 豆包语音",
                     SpeechConfig.MINIMAX to "MiniMax 官方", SpeechConfig.MOSSLAND to "模思 Mossland",
                     SpeechConfig.OPENAI to "Audio API 兼容"), onStt)
+            if (speech.isBailian) TextButton(enabled = enabled, onClick = {
+                onChange(settings.copy(speech = speech.copy(sttBaseUrl = TokenPlanSpeech.BASE, sttModel = TokenPlanSpeech.ASR_MODEL)))
+            }) { Text("填入 Token Plan 套餐配置") }
+            if (speech.isBailian && !speech.tokenPlanStt) TextButton(enabled = enabled, onClick = {
+                onChange(settings.copy(speech = speech.copy(sttModel = "paraformer-realtime-8k-v2")))
+            }) { Text("使用 Paraformer 8k 情绪识别") }
             FormField("识别接口地址", speech.sttBaseUrl, enabled, placeholder = "填写识别服务的地址") { onChange(settings.copy(speech = speech.copy(sttBaseUrl = it.trim()))) }
             FormField("识别 API Key", speech.sttKey, enabled, secret = true,
                 placeholder = if (speech.isBailian) "填写百炼 API Key" else "填写识别服务的 API Key") { onChange(settings.copy(speech = speech.copy(sttKey = it.trim()))) }
@@ -84,22 +91,57 @@ import java.util.Locale
                 }
             } else FormField("识别模型", speech.sttModel, enabled) { onChange(settings.copy(speech = speech.copy(sttModel = it.trim()))) }
             Hint(when (speech.provider) {
-                SpeechConfig.BAILIAN -> "地址、密钥和模型需属于同一地域。百炼识别使用 Paraformer 协议。"
+                SpeechConfig.BAILIAN -> if (speech.tokenPlanStt) "填写北京 Token Plan 套餐专属 Key；说完一段后识别。套餐支持范围与使用规则以阿里云为准。"
+                    else if (speech.sttModel == "paraformer-realtime-8k-v2") "该模型仅识别中文，耳畔会转换为 8k 音频，原生返回正面、负面、中性三类线索。想保留更高采样率和七类情绪，可选择 Qwen ASR。"
+                    else "普通 Paraformer v2 可返回时间戳，不能识别情绪；可改用 8k 情绪模型，或在下方配置情绪补充。套餐 Key 请点上方套餐配置。"
+                SpeechConfig.QWEN_ASR -> "使用北京或新加坡普通百炼 Key及同地域兼容模式地址。一次返回文字和七类情绪，无需另开音频理解。开启传递开关才会把线索发给聊天；当前协议不提供词时间戳。"
                 SpeechConfig.VOLCENGINE -> "选择账号已开通的识别类型。新版填写 API Key；旧版在密钥框填写 Access Token，并填写识别 App ID。"
                 SpeechConfig.MINIMAX -> "使用 MiniMax 官方密钥，识别模型保持 asr-1.0。"
                 SpeechConfig.MOSSLAND -> "使用 Moss API 密钥，日常通话可先选普通转写。"
                 else -> "服务需支持 Audio API 语音识别接口。"
             })
             ConfigDivider()
+            EmotionSourceEditor(settings.emotionSource, enabled) {
+                onChange(settings.copy(emotionSource = it))
+            }
+            ConfigDivider()
             }
             SectionTitle("语音合成")
             ProviderField("服务商", ttsProvider, enabled,
-                listOf(SpeechConfig.BAILIAN to "阿里云百炼", SpeechConfig.VOLCENGINE to "火山引擎 / 豆包语音", SpeechConfig.MINIMAX to "MiniMax 官方", SpeechConfig.ELEVENLABS to "ElevenLabs", SpeechConfig.MOSSLAND to "模思 Mossland", SpeechConfig.QWEN_LOCAL to "本机语音", SpeechConfig.OPENAI to "Audio API 兼容"), onTts)
+                listOf(SpeechConfig.BAILIAN to "阿里云百炼", SpeechConfig.VOLCENGINE to "火山引擎 / 豆包语音", SpeechConfig.MINIMAX to "MiniMax 官方", SpeechConfig.ELEVENLABS to "ElevenLabs", SpeechConfig.FISH_AUDIO to "Fish Audio 官方", SpeechConfig.MOSSLAND to "模思 Mossland", SpeechConfig.QWEN_LOCAL to "本机语音", SpeechConfig.OPENAI to "Audio API 兼容"), onTts)
+            if (ttsProvider == SpeechConfig.FISH_AUDIO) Hint("使用 Fish Audio 的 API Key，从声音详情复制音色 ID（reference_id）。回复分段合成，声音边生成边播放。")
             if (ttsProvider == SpeechConfig.ELEVENLABS) Hint("填写 ElevenLabs API Key 和 Voice ID，可使用平台官方音色。消耗 ElevenLabs 额度；连接测试也会合成一句短语。")
-            if (ttsProvider == SpeechConfig.MINIMAX) Hint("填写 MiniMax 官方 Key 和音色 ID；百炼 Key 不适用。此接法尚待真实账号验证。")
+            if (ttsProvider == SpeechConfig.MINIMAX) {
+                ProviderField("MiniMax 接法", speech.effectiveMiniMaxTransport, enabled, listOf(
+                    "bidi" to "实时接收文字（原接法）",
+                    "http_whole" to "整条提交、流式播放（测试）",
+                    "http_sentence" to "按句号提交（测试）",
+                    "http_300" to "每 300 字提交（测试）")) {
+                    onChange(settings.copy(speech = speech.copy(miniMaxTransport = it)))
+                }
+                Hint(when (speech.effectiveMiniMaxTransport) {
+                    "http_sentence" -> "遇句号、问号或叹号逐句提交，逗号不单独提交；无句末最多等2.5秒，单段最多300字。依次合成，收到声音即播放。请求会更多，仍可能限流；失败不自动重播。"
+                    "http_300" -> "每攒满300字提交一段，包含标点；回复写完后提交不足300字的尾段。依次合成，收到声音即播放；首声可能更晚。失败不自动重播。"
+                    "http_whole" -> "等整条回复写完再提交，声音边生成边播放；单条少于10000字符。用于对照截断问题，尚未确认解决限流。模型、音色与密钥沿用，不会失败后自动重播。"
+                    else -> "文字生成时陆续合成，保留原实时接法。填写 MiniMax Key 和音色 ID；百炼 Key 不适用。"
+                })
+            }
             if (ttsProvider == SpeechConfig.MOSSLAND) Hint("在 Moss API 控制台创建 Key，从 Mossland 音色库复制音色 ID。支持声音边生成边播放；克隆音色请先在模思平台创建。")
             if (ttsProvider == SpeechConfig.QWEN_LOCAL) Hint("使用你电脑上的 Qwen 声音服务。先在电脑开启并完成预热；手机与电脑需保持 Tailscale 连接。原声留在电脑上，服务关闭时会提示，不会自动切换到付费云端。")
-            FormField("合成接口地址", speech.ttsBaseUrl, enabled, placeholder = "填写合成服务的地址") { onChange(settings.copy(speech = speech.copy(ttsBaseUrl = it.trim()))) }
+            if (ttsProvider == SpeechConfig.BAILIAN) {
+                TextButton(enabled = enabled, onClick = {
+                    onChange(settings.copy(speech = speech.copy(ttsBaseUrl = TokenPlanSpeech.BASE,
+                        ttsModel = TokenPlanSpeech.TTS_MODEL, voice = TokenPlanSpeech.VOICE)))
+                }) { Text("填入 Token Plan 套餐配置") }
+                if (speech.tokenPlanTts) Hint("使用套餐专属 Key，声音边生成边播放。默认龙安陆风；也可填写与该模型匹配的音色 ID。连接测试会消耗套餐额度，使用范围以平台规则为准。")
+            }
+            if (speech.miniMaxHttpTts) {
+                FormField("MiniMax HTTP 合成地址", speech.effectiveMiniMaxHttpUrl, enabled,
+                    placeholder = "https://api.minimax.cn/v1/t2a_v2") {
+                    onChange(settings.copy(speech = speech.copy(miniMaxHttpUrl = it.trim())))
+                }
+                Hint("原实时地址单独保留，切回即可使用。官方地址已对应；自定义中转请填它支持的完整 HTTP 合成地址。")
+            } else FormField("合成接口地址", speech.ttsBaseUrl, enabled, placeholder = "填写合成服务的地址") { onChange(settings.copy(speech = speech.copy(ttsBaseUrl = it.trim()))) }
             FormField(if (ttsProvider == SpeechConfig.QWEN_LOCAL) "独立 TTS 令牌" else "合成 API Key", speech.ttsKey, enabled, secret = true,
                 placeholder = when (ttsProvider) { SpeechConfig.QWEN_LOCAL -> "填写电脑提供的 TTS 令牌"; SpeechConfig.BAILIAN -> "填写百炼 API Key"; SpeechConfig.MINIMAX -> "填写 MiniMax 官方 Key"; else -> "填写合成服务的 API Key" }) {
                 onChange(settings.copy(speech = speech.copy(ttsKey = it.trim())))
@@ -145,6 +187,18 @@ import java.util.Locale
                     else if (speech.wholeReplyTts) "等待整条回复写完，再按电脑服务支持的方式合成播放。请使用电脑端确认支持整段的声音；长回复上限由服务决定，失败时保留正文，不自动改回逐句。"
                     else "完整句子到达后交给电脑合成。开始播放的时间取决于模型和服务；请选择电脑端已验证的模式，每个声音可另存为独立方案。")
             }
+            else if (ttsProvider == SpeechConfig.FISH_AUDIO) {
+                ProviderField("合成模型", speech.ttsModel, enabled, FishSpeech.models.map { model ->
+                    model to when (model) {
+                        "s2.1-pro-free" -> "S2.1 Pro Free"
+                        "s2.1-pro" -> "S2.1 Pro"
+                        "s2-pro" -> "S2 Pro"
+                        "drama-3" -> "Drama 3"
+                        else -> "S1"
+                    }
+                }) { onChange(settings.copy(speech = speech.copy(ttsModel = it))) }
+                Hint("Free 模型的额度与开放时间以 Fish 当前政策为准；其他模型使用 API 额度。连接测试会生成一句短语，失败不会自动切换模型。")
+            }
             else if (ttsProvider == SpeechConfig.ELEVENLABS) {
                 ProviderField("合成模型", speech.ttsModel, enabled, listOf(
                     "eleven_flash_v2_5" to "Flash v2.5 · 边写边说", "eleven_v3" to "v3 · 分段朗读",
@@ -157,13 +211,19 @@ import java.util.Locale
             }
             else FormField("合成模型", speech.ttsModel, enabled) { onChange(settings.copy(speech = speech.copy(ttsModel = it.trim()))) }
             Column(Modifier.bringIntoViewRequester(voiceTarget), verticalArrangement = Arrangement.spacedBy(15.dp)) {
-                FormField("音色 ID", speech.voice, enabled, placeholder = "粘贴服务商提供的音色 ID") {
+                FormField(if (ttsProvider == SpeechConfig.FISH_AUDIO) "音色 ID（reference_id）" else "音色 ID",
+                    speech.voice, enabled, placeholder = "粘贴服务商提供的音色 ID") {
                     onChange(settings.copy(speech = speech.copy(voice = it.trim()), voiceName = null))
                 }
                 FormField("音色名称（选填）", settings.voiceName.orEmpty(), enabled, placeholder = "给这个声音起个名字") {
                     onChange(settings.copy(voiceName = it.take(80)))
                 }
                 Hint("名称仅用于首页显示，不改变音色。音色 ID 须匹配所选服务和模型。")
+                if (ttsProvider in setOf(SpeechConfig.MINIMAX, SpeechConfig.ELEVENLABS)) {
+                    key(ttsProvider, speech.ttsBaseUrl, speech.ttsKey, speech.voice, speech.ttsModel, profileId) {
+                        SpeechTuningEditor(speech, profileId, enabled, onReadElevenSettings) { onChange(settings.copy(speech = it)) }
+                    }
+                }
                 if (ttsProvider == SpeechConfig.MOSSLAND) Column {
                     ProviderField("朗读方式", speech.effectiveMossTextMode, enabled, listOf(
                         "fast" to "快速响应", "coherent" to "语气连贯", "whole" to "整条合成")) {
@@ -225,7 +285,7 @@ import java.util.Locale
 @Composable private fun Hint(text: String) { Text(text, fontSize = 12.sp, lineHeight = 19.sp, color = ErpanColors.Muted) }
 @Composable private fun ConfigDivider() { HorizontalDivider(Modifier.padding(vertical = 9.dp), thickness = 0.6.dp, color = ErpanColors.Line) }
 
-@Composable private fun ProviderField(label: String, selected: String, enabled: Boolean,
+@Composable internal fun ProviderField(label: String, selected: String, enabled: Boolean,
     choices: List<Pair<String, String>>, onChange: (String) -> Unit) {
     var open by remember { mutableStateOf(false) }
     Column(verticalArrangement = Arrangement.spacedBy(7.dp)) {
@@ -244,7 +304,7 @@ import java.util.Locale
         }
     }
 }
-@Composable private fun FormField(label: String, value: String, enabled: Boolean, secret: Boolean = false,
+@Composable internal fun FormField(label: String, value: String, enabled: Boolean, secret: Boolean = false,
     placeholder: String = "", onChange: (String) -> Unit) {
     var reveal by remember { mutableStateOf(false) }
     Column(verticalArrangement = Arrangement.spacedBy(7.dp)) {

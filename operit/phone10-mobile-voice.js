@@ -15,13 +15,15 @@
 const MOBILE_ACTION = 'com.huigu.phone10.mobile.OPERIT_VOICE';
 const CANCEL_ACTION = 'com.huigu.phone10.mobile.OPERIT_VOICE_CANCEL';
 const MOBILE_WORKFLOW = 'Phone10 独立手机语音';
+// Test history window; keep reader and reconnect-gap checks in sync.
+const HISTORY_LIMIT = 32;
 // O's current legacy JS runtime caps one script execution at 30 minutes.
 // Match that supported long-task window; this is not an unlimited task runner.
 const REPLY_TIMEOUT_MS = 30 * 60 * 1000;
 const UUID = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
 const ERROR_CODES = ['INVALID_REQUEST','OPERIT_STREAMING_UNAVAILABLE','REQUEST_ALREADY_CLAIMED',
   'OPERIT_BUSY','JOURNAL_FAILED','JOURNAL_FULL','INVALID_OPERIT_RESPONSE','RESPONSE_TOO_LARGE',
-  'OPERIT_REPLY_FAILED','OPERIT_LIST_FAILED','OPERIT_CANCEL_FAILED','OPERIT_OBSERVE_UNAVAILABLE','OPERIT_OBSERVE_FAILED'];
+  'OPERIT_REPLY_FAILED','OPERIT_LIST_FAILED','OPERIT_CANCEL_FAILED','OPERIT_CANCEL_PENDING','OPERIT_OBSERVE_UNAVAILABLE','OPERIT_OBSERVE_FAILED'];
 
 // Read-only snapshots through O's Chat API and the same MAIN runtime as voice turns.
 function observe(request, env, emit) {
@@ -30,9 +32,9 @@ function observe(request, env, emit) {
   if (typeof request.chatId !== 'string' || !request.chatId.trim() || request.chatId.length > 160 ||
       (request.after != null && (!Number.isSafeInteger(request.after) || request.after < 0))) throw Error('INVALID_REQUEST');
   const status = env.status(request.chatId);
-  const result = env.readMessages(request.chatId, {order:'desc',limit:64});
+  const result = env.readMessages(request.chatId, {order:'desc',limit:HISTORY_LIMIT});
   const finalStatus = env.status(request.chatId);
-  if (!result || result.chatId !== request.chatId || !Array.isArray(result.messages) || result.messages.length > 64 ||
+  if (!result || result.chatId !== request.chatId || !Array.isArray(result.messages) || result.messages.length > HISTORY_LIMIT ||
       !status || status.chatId !== request.chatId || !finalStatus || finalStatus.chatId !== request.chatId ||
       typeof status.isIdle !== 'boolean' || typeof finalStatus.isIdle !== 'boolean') throw Error('OPERIT_OBSERVE_FAILED');
   const messages = result.messages.slice().sort((a,b)=>a.timestamp-b.timestamp);
@@ -55,7 +57,7 @@ function observe(request, env, emit) {
     // even while O is already generating the next reply.
     let notice;
     if (!failed && request.after != null) {
-      if (messages.length === 64 && messages[0].timestamp > cursor) notice = 'HISTORY_GAP';
+      if (messages.length === HISTORY_LIMIT && messages[0].timestamp > cursor) notice = 'HISTORY_GAP';
       const candidates = messages.filter(m => m.timestamp > cursor && m.sender === 'ai' && m.content.trim());
       const m = candidates[0];
       if (m) {
@@ -78,7 +80,7 @@ function observe(request, env, emit) {
   }
   if ((ready || (streaming && !failed)) && request.after != null) {
     // Detect a missed window rather than silently skipping a backlog.
-    if (messages.length === 64 && messages[0].timestamp > cursor) throw Error('RESPONSE_TOO_LARGE');
+    if (messages.length === HISTORY_LIMIT && messages[0].timestamp > cursor) throw Error('RESPONSE_TOO_LARGE');
     let count = 0;
     for (const m of messages) {
       if (m.timestamp <= request.after) continue;
@@ -140,8 +142,20 @@ async function runAsyncRequest(request, env) {
         || !['reply','list','probe','cancel','observe'].includes(request.kind)) throw Error('INVALID_REQUEST');
     if (request.kind === 'cancel') {
       if (!UUID.test(request.targetId)) throw Error('INVALID_REQUEST');
-      env.cancel(request.targetId);
-      emit('complete'); return;
+      if (request.checkOnly !== true) env.cancel(request.targetId);
+      if (request.waitForRelease === true) {
+        // A cancellation acknowledgement is not worker termination. Never release
+        // the original claim here; its own finally block remains the only owner.
+        if (typeof env.released !== 'function') throw Error('OPERIT_CANCEL_FAILED');
+        let released = env.released(request.targetId);
+        for (let i=0; !released && i<40; i++) {
+          await env.pause(100);
+          released = env.released(request.targetId);
+        }
+        if (!released) throw Error('OPERIT_CANCEL_PENDING');
+        emit('complete', {released:true}); return;
+      }
+      emit('complete'); return; // Compatibility with older APKs.
     }
     if (!env.chat || typeof env.chat.sendMessageStreaming !== 'function') throw Error('OPERIT_STREAMING_UNAVAILABLE');
     if (request.kind === 'probe') { emit('complete'); return; }
@@ -191,7 +205,12 @@ async function runAsyncRequest(request, env) {
     if (!result || result.chatId !== request.chatId || typeof result.aiResponse !== 'string') throw Error('INVALID_OPERIT_RESPONSE');
     if (!result.aiResponse.startsWith(streamed)) throw Error('INVALID_OPERIT_RESPONSE');
     chunk(result.aiResponse.slice(streamed.length));
-    if (!stopped) { env.mark(request.id, 'done'); emit('complete'); }
+    if (!stopped) {
+      env.mark(request.id, 'done');
+      // sendMessageStreaming has returned; release before advertising completion.
+      if (env.release) { env.release(request.id); claimed=false; }
+      emit('complete');
+    }
   } catch (error) {
     if (claimed && !stopped) env.mark(request.id, sent ? 'unknown' : 'failed');
     const message = String(error && error.message || '');
@@ -202,26 +221,45 @@ async function runAsyncRequest(request, env) {
   }
 }
 
+// Android 12 compatibility revision 20261019. Channel APIs are available since
+// Android API 1; InputStream.transferTo requires API 33 on the host runtime.
+function copyStreamCompat(input, output) {
+  const source = Java.type('java.nio.channels.Channels').newChannel(input);
+  const target = output.getChannel();
+  let offset = 0;
+  while (true) {
+    const count = Number(target.transferFrom(source, offset, 1024 * 1024));
+    if (count === 0) return;
+    if (!Number.isSafeInteger(count) || count < 0) throw Error('STREAM_COPY_FAILED');
+    offset += count;
+  }
+}
+
 // Built from operit/native/NativeHistoryRead.java. No download or credentials.
 let nativeHistoryReady=false;
 function ensureNativeHistory(context) {
   if(nativeHistoryReady)return;
-  const file=Java.type('java.io.File').newInstance(context.getFilesDir(),'phone10-native-read-8799234c1d79d892.jar');
+  // A failed older script can leave its read-only final file empty. Use a new
+  // name and publish only a complete copy, preserving the old file for rollback.
+  const File=Java.type('java.io.File');
+  const file=File.newInstance(context.getFilesDir(),'phone10-native-read-ebd520325e38e82d-compat12.jar');
   if(!file.exists()){
-    const bytes=Java.type('java.util.Base64').getDecoder().decode('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');
+    const bytes=Java.type('java.util.Base64').getDecoder().decode('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');
     const input=Java.type('java.io.ByteArrayInputStream').newInstance(bytes);
-    const output=Java.type('java.io.FileOutputStream').newInstance(file);
+    const temporary=File.newInstance(context.getFilesDir(),'phone10-native-read-'+String(Java.type('java.util.UUID').randomUUID())+'.tmp');
+    const output=Java.type('java.io.FileOutputStream').newInstance(temporary);
     try {
-      if(!file.setReadOnly())throw Error('NATIVE_HISTORY_READONLY_FAILED');
-      input.transferTo(output);
+      if(!temporary.setReadOnly())throw Error('NATIVE_HISTORY_READONLY_FAILED');
+      copyStreamCompat(input,output);
     } finally {input.close();output.close();}
+    if(!temporary.renameTo(file) && !file.exists())throw Error('NATIVE_HISTORY_WRITE_FAILED');
   }
   const digest=Java.type('java.security.MessageDigest').getInstance('SHA-256');
   const raw=Java.type('java.io.FileInputStream').newInstance(file);
   const checked=Java.type('java.security.DigestInputStream').newInstance(raw,digest);
   try{while(checked.read()!==-1){}}finally{checked.close();}
   const actual=digest.digest().map(b=>(b&255).toString(16).padStart(2,'0')).join('');
-  if(actual!=='8799234c1d79d89293848e8c685979f7580d7b63e3132732a6cd6812f3519a42')throw Error('NATIVE_HISTORY_HASH_MISMATCH');
+  if(actual!=='ebd520325e38e82d791a6d1b2773396232ca78573d704ee242aaeede944627ec')throw Error('NATIVE_HISTORY_HASH_MISMATCH');
   Java.loadJar(String(file.getAbsolutePath()));
   nativeHistoryReady=true;
 }
@@ -229,17 +267,12 @@ function ensureNativeHistory(context) {
 function readMainMessages(context, chatId) {
   try {
     const type = name => Java.type('com.ai.assistance.operit.' + name);
-    const parameters = [['chat_id',chatId],['order','desc'],['limit','64']]
+    const parameters = [['chat_id',chatId],['order','desc'],['limit',String(HISTORY_LIMIT)]]
       .map(pair => type('data.model.ToolParameter').newInstance(...pair));
     const tool = type('data.model.AITool').newInstance('get_chat_messages',parameters,'');
     const reader = type('core.tools.defaultTool.standard.StandardChatManagerTool').newInstance(context);
     ensureNativeHistory(context);
-    const result = Java.type('com.huigu.phone10.compat.NativeHistoryRead').read(reader,tool,5000);
-    if (!result.getSuccess()) throw Error('OPERIT_OBSERVE_FAILED');
-    const data = result.getResult();
-    return {chatId:data.getChatId(),messages:data.getMessages().map(m => ({
-      timestamp:m.getTimestamp(),sender:m.getSender(),content:m.getContent(),roleName:String(m.getRoleName() || '')
-    }))};
+    return Java.type('com.huigu.phone10.compat.NativeHistoryRead').readSnapshot(reader,tool,5000);
   } catch (_) { throw Error('OPERIT_OBSERVE_FAILED'); }
 }
 
@@ -306,6 +339,14 @@ function host(context, uri) {
       });
     },
     state(id) { return read(id)?.state; },
+    released(id) {
+      // SharedPreferences applies a commit atomically in this O process. Polling
+      // must not take the file lock the original worker needs in order to release.
+      const process=Java.type('android.os.Process');
+      const epoch=String(process.myPid())+':'+String(process.getStartElapsedRealtime());
+      return String(prefs.getString('_epoch','')) !== epoch || read(id) == null;
+    },
+    pause(ms) { Java.type('java.lang.Thread').sleep(ms); },
     started(id) {
       locked(() => {
         const r = read(id);
@@ -338,10 +379,8 @@ function host(context, uri) {
       });
     },
     emit(event) {
-      const values = Java.type('android.content.ContentValues').newInstance();
-      values.put('event', JSON.stringify(event));
-      const result = context.getContentResolver().insert(uri, values);
-      return result !== null && String(result.getQueryParameter('status')) === 'accepted';
+      ensureNativeHistory(context);
+      return Java.type('com.huigu.phone10.compat.NativeHistoryRead').emitEvent(context,uri,JSON.stringify(event));
     }
   };
 }
@@ -405,7 +444,7 @@ function loadWorker(context) {
       const output = Java.type('java.io.FileOutputStream').newInstance(temporary);
       try {
         if (!temporary.setReadOnly()) throw Error('WORKER_LOAD');
-        input.transferTo(output);
+        copyStreamCompat(input,output);
       } finally { input.close(); output.close(); }
       // Path is Iterable; O's bridge recursively serializes it and overflows.
       // File.renameTo returns a boolean and stays inside the same private dir.

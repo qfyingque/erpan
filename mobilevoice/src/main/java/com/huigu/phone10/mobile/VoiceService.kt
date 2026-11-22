@@ -140,10 +140,16 @@ class VoiceService : Service() {
         if (started) return START_NOT_STICKY
         // A killed service or stale pending intent never restarts recording.
         if (intent == null) { stopSelf(); return START_NOT_STICKY }
+        val incoming = if (intent.action == INCOMING) {
+            try { IncomingCalls.takeAccepted(this, intent.getStringExtra("invite").orEmpty()) }
+            catch (_: Exception) { null }
+        } else null
+        if (intent.action == INCOMING && incoming == null) { stopSelf(); return START_NOT_STICKY }
         started = true
         activeService = this
         try {
             config = SettingsStore(this).load()
+            if (incoming != null) require(config.chatId == incoming.chatId && !config.listenOnly)
             require(config.chatId.isNotBlank())
             if (!config.listenOnly && config.confirmBeforeSend) require(Settings.canDrawOverlays(this))
             config.speech.validate(includeRecognition = !config.listenOnly)
@@ -174,8 +180,9 @@ class VoiceService : Service() {
                         stopSelf()
                     }
                 }
-            } else toggle()
+            } else toggle(incoming)
         } catch (_: Exception) {
+            incoming?.let { IncomingCalls.finish(this, it.id, "FAILED") }
             terminalMessage = "启动失败，请检查语音配置、聊天选择及权限。"; stopSelf()
         }
         return START_NOT_STICKY
@@ -184,6 +191,7 @@ class VoiceService : Service() {
     private fun setState(message: String, mic: Boolean = conversation?.microphoneEnabled == true, changing: Boolean = false) {
         if (!started) return
         val status = if (config.listenOnly && message.startsWith("正在聆听")) "只听回复已开启 · 等待新的回复"
+            else if (!config.listenOnly && mic && message.startsWith("只听回复已开启")) "通话中 · 正在聆听"
             else if (!mic && !changing && message.startsWith("正在聆听"))
             "麦克风已关闭 · 点悬浮球可再开麦" else message
         mutableState.value = VoiceState(true, status, mic, changing, mutableState.value.overlayVisible,
@@ -278,7 +286,7 @@ class VoiceService : Service() {
         overlay?.reposition()
     }
 
-    private fun toggle() {
+    private fun toggle(incoming: IncomingInvite? = null) {
         if (!started || config.listenOnly || transition?.isActive == true) return
         transition = scope.launch {
             if (recorder != null) mute("麦克风已关闭 · AI 回复与声音继续")
@@ -287,9 +295,11 @@ class VoiceService : Service() {
                 try {
                     if (callScope == null) beginSession()
                     beginCapture()
+                    incoming?.let { conversation?.playReply(it.text) }
                 }
                 catch (cancelled: CancellationException) { throw cancelled }
                 catch (_: Exception) {
+                    incoming?.let { IncomingCalls.finish(this@VoiceService, it.id, "FAILED") }
                     mute("开麦失败，请检查麦克风权限或音频占用。")
                     VoiceDiagnostics.record("capture_start_failed")
                     if (conversation == null) {
@@ -322,7 +332,10 @@ class VoiceService : Service() {
             }
         }
         val speechClient = okhttp3.OkHttpClient()
-        val cloud = CloudSpeech(config.speech, client = speechClient, onSynthesisStatus = synthesisStatus)
+        val cloud = CloudSpeech(config.speech, client = speechClient, onSynthesisStatus = synthesisStatus,
+            requestEmotionHints = config.sendEmotionHints, requestTimingHints = config.sendTimingHints)
+        val recognition = EmotionRecognition(enabled = config.sendEmotionHints, source = config.emotionSource,
+            primary = cloud::transcribeDetailed, analyze = cloud::analyzeEmotion)
         val synthesisClients = mutableMapOf(config.speech to cloud)
         val o = OperitBridge(this).also { bridge = it }
         val judge = if (!config.listenOnly && config.smartEndpoint && !config.confirmBeforeSend)
@@ -357,7 +370,7 @@ class VoiceService : Service() {
                 } else null
             return ReplyVoice({ text -> play(voiceSettings = selected) { output ->
                 output.markCaptionSegment(text); tts.speak(text, output::configure, output::write)
-            } }, stream, speech.sentenceHttpTts, speech.wholeReplyTts, speech.clientSegmentedTts, speech.coherentTts)
+            } }, stream, speech.sentenceHttpTts, speech.wholeReplyTts, speech.clientSegmentedTts, speech.coherentTts, speech.miniMaxChunkMode)
         }
         VoiceConversation(child, cloud::transcribe,
             { text, chunk -> o.reply(config.chatId, text, chunk) },
@@ -378,9 +391,13 @@ class VoiceService : Service() {
             wholeReplyTts = config.speech.wholeReplyTts,
             firstClauseTts = config.speech.clientSegmentedTts,
             coherentTts = config.speech.coherentTts,
-            transcribeDetailed = cloud::transcribeDetailed,
+            miniMaxChunkMode = config.speech.miniMaxChunkMode,
+            prepareTranscription = recognition::prepare,
             confirmBeforeSend = !config.listenOnly && config.confirmBeforeSend,
             soundCuesEnabled = !config.listenOnly && config.preserveBreath,
+            sendEmotionHints = config.sendEmotionHints,
+            sendTimingHints = config.sendTimingHints,
+            onMicrophoneChanged = recognition::setMicrophoneEnabled,
             onDraftChanged = { draft ->
                 if (started && callScope === child) updatePendingDraft(draft)
             }, onReplyStart = {
@@ -758,6 +775,7 @@ class VoiceService : Service() {
     }
 
     companion object {
+        const val INCOMING = "com.huigu.phone10.mobile.ACCEPTED_INCOMING"
         const val PROBE = "com.huigu.phone10.mobile.CAPTURE_PROBE"
         const val PROBE_PLAY = "com.huigu.phone10.mobile.CAPTURE_PROBE_PLAY"
         private var latestSynthesisOwner: Any? = null

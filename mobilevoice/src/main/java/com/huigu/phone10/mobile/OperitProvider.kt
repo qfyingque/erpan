@@ -16,8 +16,8 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.channels.Channel
 
 /** Pure in-memory request/response protocol, separately tested on the JVM. */
-internal class OperitPending(val kind: String, chatId: String? = null, text: String? = null, targetId: String? = null, after: Long? = null,
-                            paged: Boolean = false) {
+internal class OperitPending(val kind: String, val chatId: String? = null, text: String? = null, targetId: String? = null, after: Long? = null,
+                            paged: Boolean = false, waitForRelease: Boolean = false, checkOnly: Boolean = false) {
     val id: String = UUID.randomUUID().toString()
     val nonce: String = UUID.randomUUID().toString()
     private var payload: String? = JsonObject().apply {
@@ -26,6 +26,8 @@ internal class OperitPending(val kind: String, chatId: String? = null, text: Str
         targetId?.let { addProperty("targetId", it) }
         after?.let { addProperty("after", it) }
         if (paged) addProperty("paged", true)
+        if (waitForRelease) addProperty("waitForRelease", true)
+        if (checkOnly) addProperty("checkOnly", true)
     }.toString()
     val events = Channel<JsonObject>(128)
     @Volatile var cancelled = false

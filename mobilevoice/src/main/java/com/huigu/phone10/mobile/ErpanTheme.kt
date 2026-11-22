@@ -33,6 +33,9 @@ internal object ErpanColors {
     val Coal = Color(0xFF242628)
     val CoalText = Color(0xFFF7F3F2)
     val CoalMuted = Color(0xFFBEBBC0)
+    val SwitchOffTrack = Color(0xFF34363A)
+    val SwitchOffThumb = Color(0xFF929198)
+    val SwitchOffBorder = Color(0xFF79787E)
 }
 
 @Composable internal fun ErpanTheme(content: @Composable () -> Unit) {

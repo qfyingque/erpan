@@ -49,6 +49,7 @@ internal fun VoiceProfile.description(): String {
         }
         SpeechConfig.MINIMAX -> "MiniMax 官方"
         SpeechConfig.ELEVENLABS -> "ElevenLabs"
+        SpeechConfig.FISH_AUDIO -> "Fish Audio"
         SpeechConfig.QWEN_LOCAL -> if (speech.clientSegmentedTts) "本机语音 · 首句先读" else if (speech.wholeReplyTts) "本机语音 · 整段" else "本机语音"
         else -> "Audio API 兼容"
     }

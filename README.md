@@ -6,7 +6,7 @@
 
 [下载](https://github.com/qfyingque/erpan/releases) · [使用说明](使用说明.md) · [开发接入](开发接入.md) · [更新说明](CHANGELOG.md) · [隐私](PRIVACY.md)
 
-当前整理版本：**code68 / 0.3.37-preview**。功能沿用 code67，统一教程、插件升级说明与发布材料；本次手机长回复、尾音和连续播放尚待试听，见 [验证范围](VERIFICATION.md)。
+当前整理版本：**code80 / 0.3.46-emotion-preview**。完整继承 code79，补齐Qwen、火山和百炼8k的原生情绪，其他识别可选配置额外音频情绪来源；默认关闭补充调用。配置与范围见 [声音情绪说明](声音情绪识别.md)。
 
 ## 能做什么
 

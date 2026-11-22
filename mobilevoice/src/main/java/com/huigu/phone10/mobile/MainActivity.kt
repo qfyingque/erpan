@@ -71,6 +71,7 @@ class MainActivity : ComponentActivity() {
         var listing by remember { mutableStateOf(false) }
         var chats by remember { mutableStateOf<List<OperitChat>?>(null) }
         var dialog by remember { mutableStateOf<Pair<String, String>?>(null) }
+        var showVoiceDiagnostics by rememberSaveable { mutableStateOf(false) }
         var askSave by remember { mutableStateOf(false) }
         var checking by remember { mutableStateOf(false) }
         var checkJob by remember { mutableStateOf<Job?>(null) }
@@ -398,6 +399,11 @@ class MainActivity : ComponentActivity() {
                 },
                 onBack = { back() })
             "config" -> ErpanConfig(draft, enabled = !state.running && !busy && !checking, listing = listing, notice = notice, target = target,
+                profileId = editingProfileId, onReadElevenSettings = { expected, profileId, fetched ->
+                    val next = if (page == "config" && !state.running && !busy && !checking && editingProfileId == profileId)
+                        draft.withReadElevenVoiceSettings(expected, fetched) else null
+                    if (next == null) false else { draft = next; true }
+                },
                 onChange = { draft = it }, onStt = { provider ->
                     val current = draft.speech
                     val currentProvider = current.provider ?: SpeechConfig.OPENAI
@@ -415,7 +421,8 @@ class MainActivity : ComponentActivity() {
                             ttsKey = old.first.ttsKey, ttsModel = old.first.ttsModel, voice = old.first.voice,
                             volcResource = old.first.volcResource, volcAppId = old.first.volcAppId,
                             voicePrompt = old.first.voicePrompt, mossSpeed = old.first.mossSpeed,
-                            mossTextMode = old.first.mossTextMode), voiceName = old?.second)
+                            mossTextMode = old.first.mossTextMode, miniMaxVoiceSettings = old.first.miniMaxVoiceSettings,
+                            elevenVoiceSettings = old.first.elevenVoiceSettings), voiceName = old?.second)
                     }
                 }, onChats = {
                     if (!listing) {
@@ -472,7 +479,12 @@ class MainActivity : ComponentActivity() {
                     } else if (!VoiceService.showPendingDraft())
                         notice = "草稿已结束；下次识别后会在悬浮待发栏显示。"
                 }, onAvatar = { openAppearance() }, onConfig = { openConfig() },
-                onLogs = { dialog = "最近语音状态" to VoiceDiagnostics.snapshot().ifBlank { "暂无记录" } }, onAbout = { showAbout() },
+                onEmotionHints = { enabled ->
+                    if (!VoiceService.state.value.running && !saved.listenOnly) persist(saved.copy(sendEmotionHints = enabled))
+                }, onTimingHints = { enabled ->
+                    if (!VoiceService.state.value.running && !saved.listenOnly) persist(saved.copy(sendTimingHints = enabled))
+                },
+                onLogs = { showVoiceDiagnostics = true }, onAbout = { showAbout() },
                 onProfiles = { openProfiles() },
                 onCaptions = { enabled -> floatingPreference("captions", enabled) },
                 onCaptionAppearance = {
@@ -494,6 +506,7 @@ class MainActivity : ComponentActivity() {
             text = { Text("配置有尚未保存的内容。") },
             confirmButton = { TextButton(enabled = !busy, onClick = { saveEditor() }) { Text("保存并使用") } },
             dismissButton = { TextButton(enabled = !busy, onClick = { draft = saved; askSave = false; page = configReturn; notice = "" }) { Text("放弃修改") } })
+        if (showVoiceDiagnostics) VoiceDiagnosticsDialog(saved, state) { showVoiceDiagnostics = false }
         dialog?.let { (title, text) -> AlertDialog(onDismissRequest = { dialog = null }, title = { Text(title) },
             text = { Text(text, Modifier.heightIn(max = 480.dp).verticalScroll(rememberScrollState()), fontSize = 13.sp) },
             confirmButton = { TextButton(onClick = { dialog = null }) { Text("关闭") } }) }

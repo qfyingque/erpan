@@ -24,7 +24,7 @@
 
 ### 可选声音线索
 
-`SpeechTranscript.kt` 中的 `ENABLE_VOICE_HINTS` 默认是 `false`，普通设置页不显示开关，聊天只收到识别原文。接入情绪识别并验证返回字段后，可手动改成 `true` 并重新构建。开启后，服务商实际返回的受支持情绪和时间信息会附在同一条消息后面；该开关本身不会让识别模型获得情绪识别能力。
+code78起通过首页「传递情绪线索」「传递停顿信息」分别控制，默认关闭。配置由MobileSettings的sendEmotionHints/sendTimingHints沿原加密设置存储；VoiceService将快照传给VoiceConversation，由SpeechTranscript.forChat按两项选择生成同一条消息。普通百炼详细返回的受支持情绪/时间信息才会附加；缺字段保持原转写。开关不会让识别模型获得新能力，不新增情绪模型请求。确认改字后沿withText丢弃旧元信息，智能结束判断只看转写原文。
 
 先运行 README 中的 Android 和 Node 测试。修改协议时检查请求次数、顺序、超时、取消及迟到事件；修改界面与悬浮球时需要真机检查权限、头像、麦克风状态和结束语音。
 

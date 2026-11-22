@@ -21,8 +21,9 @@ test('worker bootstrap avoids Path conversion recursion in the real O Java bridg
       createTempFile() { files.add('/worker/precreated.tmp'); return file('/worker/precreated.tmp'); }
     };
     if (name === 'java.nio.file.Files') return {};
+    if (name === 'java.nio.channels.Channels') return {newChannel: input=>input};
     if (name === 'java.io.FileOutputStream') return {newInstance: target=>({
-      write(){files.add(target.getAbsolutePath());calls.push('copy');},close(){}
+      getChannel:()=>({transferFrom(input,offset){if(offset)return 0;files.add(target.getAbsolutePath());calls.push('copy');return 1;}}),close(){}
     })};
     if (name.endsWith('.OperitRequestWorker')) return {newInstance: () => worker};
     throw Error('unexpected native type ' + name);
